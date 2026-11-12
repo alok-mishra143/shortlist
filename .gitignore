@@ -1,0 +1,55 @@
+# ─── Build output ─────────────────────────────────────────────
+/target/
+**/target/
+*.pdb
+*.profraw
+perf.data
+
+# ─── Model files ──────────────────────────────────────────────
+# Downloaded by scripts/fetch-model.sh, not committed.
+/assets/models/
+*.onnx
+
+# ─── Local databases and indexes ──────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ─── Logs and crash dumps ─────────────────────────────────────
+*.log
+/logs/
+crashdumps/
+*.crash
+
+# ─── Environment and secrets ──────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Packaging output ─────────────────────────────────────────
+/dist/
+*.dmg
+*.msi
+*.deb
+*.AppImage
+
+# ─── Editors and IDEs ─────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# ─── OS clutter ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Temporary files ──────────────────────────────────────────
+*.bak
+*.orig
+*.rej
+*.tmp
+*~

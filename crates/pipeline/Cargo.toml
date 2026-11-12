@@ -1,0 +1,12 @@
+[package]
+name = "shortlist-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shortlist-core = { path = "../core" }
+shortlist-store = { path = "../store" }
+shortlist-embed = { path = "../embed" }
+shortlist-ai = { path = "../ai" }
+anyhow.workspace = true

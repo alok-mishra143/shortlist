@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 620" width="1600" height="620" role="img" aria-label="Shortlist — ten candidates, every one defensible">
+  <defs>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#2A2E26" stroke-width="1" opacity="0.7"/>
+    </pattern>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1310 40) rotate(125) scale(800 640)">
+      <stop offset="0" stop-color="#7FC08D" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#7FC08D" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#15170F"/>
+      <stop offset="1" stop-color="#101208"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1600" height="620" rx="32" fill="#0B0C0A"/>
+  <rect width="1600" height="620" rx="32" fill="url(#grid)"/>
+  <rect width="1600" height="620" rx="32" fill="url(#glow)"/>
+
+  <!-- eyebrow -->
+  <circle cx="101" cy="118" r="6" fill="#8FCB9B"/>
+  <text x="120" y="124" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" letter-spacing="4.2" fill="#8FCB9B">LOCAL-FIRST RECRUITING</text>
+
+  <!-- wordmark -->
+  <text x="90" y="282" font-family="Georgia, 'Iowan Old Style', 'Times New Roman', serif" font-size="132" letter-spacing="-3" fill="#F4F1E8">Shortlist</text>
+
+  <rect x="94" y="318" width="88" height="4" rx="2" fill="#8FCB9B"/>
+
+  <!-- tagline -->
+  <text x="92" y="404" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="46" font-weight="600" letter-spacing="-0.8" fill="#F4F1E8">Ten candidates.</text>
+  <text x="92" y="460" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="46" font-weight="600" letter-spacing="-0.8" fill="#F4F1E8">Every one defensible.</text>
+
+  <text x="94" y="522" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" fill="#9A968A">GPU-native resume screening that runs on your machine.</text>
+  <text x="94" y="556" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="21" fill="#9A968A">No webview. No cloud account. No black box.</text>
+
+  <text x="94" y="598" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" letter-spacing="2.6" fill="#6F6A5E">MACOS  ·  WINDOWS  ·  LINUX</text>
+
+  <!-- shortlist panel -->
+  <rect x="856" y="76" width="656" height="480" rx="22" fill="url(#panel)" stroke="#2A2E26"/>
+  <text x="896" y="129" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="2.6" fill="#6F6A5E">SHORTLIST · 2,000 SCANNED</text>
+  <text x="1470" y="129" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="1.6" fill="#8FCB9B">LOCAL · PRIVATE</text>
+  <line x1="896" y1="150" x2="1472" y2="150" stroke="#2A2E26" stroke-width="1"/>
+
+  <!-- row 1 -->
+  <rect x="888" y="170" width="592" height="58" rx="12" fill="#15170F" stroke="#2A2E26"/>
+  <text x="916" y="204" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#6F6A5E">01</text>
+  <circle cx="962" cy="199" r="18" fill="#1E2A20"/>
+  <text x="962" y="203" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9AD0A3">AR</text>
+  <text x="994" y="196" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#F4F1E8">A. Rahman</text>
+  <text x="994" y="215" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A8578">Senior Rust Engineer</text>
+  <text x="1450" y="201" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#F4F1E8">94</text>
+  <rect x="1388" y="209" width="62" height="4" rx="2" fill="#2A2E26"/>
+  <rect x="1388" y="209" width="58" height="4" rx="2" fill="#8FCB9B"/>
+
+  <!-- row 2 -->
+  <rect x="888" y="238" width="592" height="58" rx="12" fill="#15170F" stroke="#2A2E26"/>
+  <text x="916" y="272" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#6F6A5E">02</text>
+  <circle cx="962" cy="267" r="18" fill="#2A2519"/>
+  <text x="962" y="271" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#C7AE7E">JO</text>
+  <text x="994" y="264" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#F4F1E8">J. Okafor</text>
+  <text x="994" y="283" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A8578">Payments Infrastructure</text>
+  <text x="1450" y="269" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#F4F1E8">91</text>
+  <rect x="1388" y="277" width="62" height="4" rx="2" fill="#2A2E26"/>
+  <rect x="1388" y="277" width="56" height="4" rx="2" fill="#8FCB9B"/>
+
+  <!-- row 3 -->
+  <rect x="888" y="306" width="592" height="58" rx="12" fill="#15170F" stroke="#2A2E26"/>
+  <text x="916" y="340" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#6F6A5E">03</text>
+  <circle cx="962" cy="335" r="18" fill="#1B272A"/>
+  <text x="962" y="339" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#8FB6B1">ML</text>
+  <text x="994" y="332" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#F4F1E8">M. Lindqvist</text>
+  <text x="994" y="351" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A8578">Staff Backend Engineer</text>
+  <text x="1450" y="337" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#F4F1E8">88</text>
+  <rect x="1388" y="345" width="62" height="4" rx="2" fill="#2A2E26"/>
+  <rect x="1388" y="345" width="55" height="4" rx="2" fill="#8FCB9B"/>
+
+  <!-- row 4 -->
+  <rect x="888" y="374" width="592" height="58" rx="12" fill="#15170F" stroke="#2A2E26"/>
+  <text x="916" y="408" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#6F6A5E">04</text>
+  <circle cx="962" cy="403" r="18" fill="#1C232B"/>
+  <text x="962" y="407" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#93A8BE">SP</text>
+  <text x="994" y="400" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#F4F1E8">S. Patel</text>
+  <text x="994" y="419" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A8578">Distributed Systems</text>
+  <text x="1450" y="405" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#F4F1E8">85</text>
+  <rect x="1388" y="413" width="62" height="4" rx="2" fill="#2A2E26"/>
+  <rect x="1388" y="413" width="53" height="4" rx="2" fill="#8FCB9B"/>
+
+  <!-- row 5 -->
+  <rect x="888" y="442" width="592" height="58" rx="12" fill="#15170F" stroke="#2A2E26"/>
+  <text x="916" y="476" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="500" fill="#6F6A5E">05</text>
+  <circle cx="962" cy="471" r="18" fill="#241F2B"/>
+  <text x="962" y="475" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#B5A3C7">RM</text>
+  <text x="994" y="468" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#F4F1E8">R. Moreau</text>
+  <text x="994" y="487" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A8578">Platform Engineer</text>
+  <text x="1450" y="473" text-anchor="end" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#F4F1E8">82</text>
+  <rect x="1388" y="481" width="62" height="4" rx="2" fill="#2A2E26"/>
+  <rect x="1388" y="481" width="51" height="4" rx="2" fill="#8FCB9B"/>
+
+  <circle cx="900" cy="531" r="4" fill="#8FCB9B"/>
+  <text x="914" y="536" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#6F6A5E">Every score carries quoted evidence and a two-line rationale.</text>
+</svg>

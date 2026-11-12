@@ -1,0 +1,10 @@
+[package]
+name = "shortlist-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shortlist-core = { path = "../core" }
+anyhow.workspace = true
+fastembed = "7"

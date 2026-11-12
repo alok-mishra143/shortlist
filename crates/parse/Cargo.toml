@@ -1,0 +1,18 @@
+[package]
+name = "shortlist-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shortlist-pdf"
+path = "src/bin/pdf_text.rs"
+
+[dependencies]
+shortlist-core = { path = "../core" }
+anyhow.workspace = true
+pdf-extract = "0.7"
+zip = "2"
+quick-xml = "0.37"
+regex = "1"
+uuid.workspace = true

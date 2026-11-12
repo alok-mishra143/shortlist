@@ -1,0 +1,18 @@
+[package]
+name = "shortlist-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shortlist-cli"
+path = "src/main.rs"
+
+[dependencies]
+shortlist-core = { path = "../core" }
+shortlist-store = { path = "../store" }
+shortlist-parse = { path = "../parse" }
+shortlist-embed = { path = "../embed" }
+shortlist-pipeline = { path = "../pipeline" }
+shortlist-ai = { path = "../ai" }
+anyhow.workspace = true
