@@ -70,6 +70,83 @@ $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant
 $name = Split-Path -Leaf $zip
 Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $name" -Encoding ascii
 
+# First-install format: a per-user setup.exe with a Start Menu shortcut and an
+# uninstaller. The zip above stays the in-app update format; the updater
+# downloads, verifies, and extracts it.
+$setupName = "Shortlist-windows-$arch-setup"
+$setup = Join-Path $out "$setupName.exe"
+
+$isccCandidates = @()
+if (${env:ProgramFiles(x86)}) {
+    $isccCandidates += (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe")
+}
+if ($env:ProgramFiles) {
+    $isccCandidates += (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+}
+$iscc = $null
+foreach ($candidate in $isccCandidates) {
+    if (Test-Path -LiteralPath $candidate) { $iscc = $candidate; break }
+}
+if (-not $iscc) {
+    $command = Get-Command iscc.exe -ErrorAction SilentlyContinue
+    if ($command) { $iscc = $command.Source }
+}
+
+if (-not $iscc) {
+    Write-Host "Inno Setup (ISCC.exe) not found; skipping $setupName.exe."
+} else {
+    $iss = Join-Path $out "shortlist-setup.iss"
+    $script = @"
+#define AppName "Shortlist"
+#define AppVersion "$version"
+#define AppExe "shortlist.exe"
+
+[Setup]
+AppId={{6F0D9C7E-3B0A-4B7E-9A6E-2F4B1C8D5A31}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
+AppPublisher=Shortlist
+DefaultDirName={localappdata}\Programs\Shortlist
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayIcon={app}\{#AppExe}
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+[Files]
+Source: "$app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{group}\Shortlist"; Filename: "{app}\{#AppExe}"
+Name: "{autodesktop}\Shortlist"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\{#AppExe}"; Description: "Launch Shortlist"; Flags: nowait postinstall skipifsilent
+"@
+    Set-Content -LiteralPath $iss -Value $script -Encoding ascii
+
+    foreach ($path in @($setup, "$setup.sha256")) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+
+    Write-Host "Packaging $setup..."
+    & $iscc /Qp "/O$out" "/F$setupName" $iss
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+    Remove-Item -LiteralPath $iss -Force
+
+    $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+    $setupFile = Split-Path -Leaf $setup
+    Set-Content -LiteralPath "$setup.sha256" -Value "$setupHash  $setupFile" -Encoding ascii
+
+    Write-Host "Built $setup"
+    Write-Host "Checksum: $setupHash"
+}
+
 Write-Host ""
 Write-Host "Built $zip"
 Write-Host "Checksum: $hash"

@@ -27,6 +27,7 @@ esac
 OUT="$ROOT/dist"
 APP="$OUT/Shortlist.app"
 ZIP="$OUT/Shortlist-macos-$ARCH.zip"
+DMG="$OUT/Shortlist-macos-$ARCH.dmg"
 
 MODEL_DIR="$ROOT/assets/models/e5-small-v2"
 if [[ ! -f "$MODEL_DIR/model_quantized.onnx" ]]; then
@@ -106,6 +107,24 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
   shasum -a 256 "Shortlist-macos-$ARCH.zip" > "Shortlist-macos-$ARCH.zip.sha256"
 )
 
+# First-install format: drag Shortlist.app to Applications. The zip above stays
+# the in-app update format; the updater downloads, verifies, and extracts it
+# without mounting anything.
+STAGE="$OUT/dmg-stage"
+rm -rf "$STAGE" "$DMG" "$DMG.sha256"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+echo "Packaging ${DMG}…"
+hdiutil create -volname "Shortlist" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGE"
+(
+  cd "$OUT"
+  shasum -a 256 "Shortlist-macos-$ARCH.dmg" > "Shortlist-macos-$ARCH.dmg.sha256"
+)
+
 echo
 echo "Built $ZIP"
 echo "Checksum: $(cut -d' ' -f1 "$ZIP.sha256")"
+echo "Built $DMG"
+echo "Checksum: $(cut -d' ' -f1 "$DMG.sha256")"

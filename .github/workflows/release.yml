@@ -96,6 +96,10 @@ jobs:
           asset="dist/Shortlist-macos-${{ matrix.arch }}.zip"
           test -s "$asset"
           test -s "$asset.sha256"
+          dmg="dist/Shortlist-macos-${{ matrix.arch }}.dmg"
+          test -s "$dmg"
+          test -s "$dmg.sha256"
+          hdiutil verify "$dmg"
           plutil -p dist/Shortlist.app/Contents/Info.plist | grep -q "\"CFBundleShortVersionString\" => \"$version\""
           unzip -l "$asset" | grep -q "Shortlist.app/Contents/MacOS/shortlist"
 
@@ -105,6 +109,8 @@ jobs:
           path: |
             dist/Shortlist-macos-${{ matrix.arch }}.zip
             dist/Shortlist-macos-${{ matrix.arch }}.zip.sha256
+            dist/Shortlist-macos-${{ matrix.arch }}.dmg
+            dist/Shortlist-macos-${{ matrix.arch }}.dmg.sha256
           if-no-files-found: error
 
   build-windows:
@@ -158,6 +164,10 @@ jobs:
       - name: Test the update protocol
         run: cargo test -p shortlist-update --quiet
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
       - name: Package app
         shell: pwsh
         env:
@@ -172,6 +182,10 @@ jobs:
           $asset = "dist/Shortlist-windows-${{ matrix.arch }}.zip"
           if (-not (Test-Path -LiteralPath $asset)) { throw "missing $asset" }
           if (-not (Test-Path -LiteralPath "$asset.sha256")) { throw "missing $asset.sha256" }
+
+          $setup = "dist/Shortlist-windows-${{ matrix.arch }}-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "missing $setup" }
+          if (-not (Test-Path -LiteralPath "$setup.sha256")) { throw "missing $setup.sha256" }
 
           $verify = "dist/verify-windows"
           if (Test-Path -LiteralPath $verify) { Remove-Item -LiteralPath $verify -Recurse -Force }
@@ -194,6 +208,8 @@ jobs:
           path: |
             dist/Shortlist-windows-${{ matrix.arch }}.zip
             dist/Shortlist-windows-${{ matrix.arch }}.zip.sha256
+            dist/Shortlist-windows-${{ matrix.arch }}-setup.exe
+            dist/Shortlist-windows-${{ matrix.arch }}-setup.exe.sha256
           if-no-files-found: error
 
   build-linux:
@@ -253,7 +269,14 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build-macos, build-windows, build-linux]
+    needs: [verify, build-macos, build-windows, build-linux]
+    # One flaky platform must not leave the release page empty. Publish the
+    # assets that built; missing platforms are simply absent from the release.
+    if: >-
+      ${{ !cancelled() && needs.verify.result == 'success' &&
+          (needs.build-macos.result == 'success' ||
+           needs.build-windows.result == 'success' ||
+           needs.build-linux.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -265,8 +288,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cat ./*.zip.sha256 > checksums.txt
-          rm -f ./*.zip.sha256
+          cat ./*.sha256 > checksums.txt
+          rm -f ./*.sha256
           cat checksums.txt
 
       - name: Create release
@@ -277,12 +300,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          assets=(
-            dist/Shortlist-macos-aarch64.zip
-            dist/Shortlist-windows-x86_64.zip
-            dist/Shortlist-linux-x86_64.zip
-            dist/checksums.txt
-          )
+          assets=(dist/checksums.txt)
+          # Installers and update archives, whichever platforms produced them.
+          for asset in dist/Shortlist-*.zip dist/Shortlist-*.dmg dist/Shortlist-*-setup.exe; do
+            if [[ -f "$asset" ]]; then
+              assets+=("$asset")
+            fi
+          done
           if gh release view "$TAG" >/dev/null 2>&1; then
             # Re-running a failed publish should replace the assets, not fail.
             gh release upload "$TAG" "${assets[@]}" --clobber
