@@ -36,7 +36,9 @@ the new build.
 
 Linux needs the usual GPUI desktop runtime: X11 or Wayland, `libxkbcommon`,
 a Vulkan driver, and OpenSSL 3. These are standard on current desktop
-distributions; the CI build runs on Ubuntu 22.04 for broad glibc compatibility.
+distributions. The CI build runs on Ubuntu 24.04 because the prebuilt ONNX
+Runtime that `ort` links against needs glibc 2.38+, so the released binary
+targets Ubuntu 24.04+ / Debian 13+.
 
 ## What a user sees
 

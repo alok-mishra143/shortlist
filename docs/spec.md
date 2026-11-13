@@ -382,7 +382,7 @@ One developer, with the recruiter available about two hours a week for labelling
 - [ ] Store the original file **and** the extracted profile for every candidate.
 - [ ] Rank against a real JD and show the ten best in under 2 minutes, with a written reason for each placement.
 - [ ] Top-10 recall ≥ 0.95 and NDCG@10 ≥ 0.85 on the recruiter-labelled golden set.
-- [ ] Runs on macOS 13+, Windows 10/11 x64, and Ubuntu 22.04+ x64.
+- [ ] Runs on macOS 13+, Windows 10/11 x64, and Ubuntu 24.04+ x64.
 - [ ] No bundled chat model, no OCR engine, no webview; the only bundled model is the 33 MB encoder.
 - [ ] Installer under 100 MB per OS; idle RAM < 150 MB; < 500 MB with 5,000 candidates.
 - [ ] Every LLM call shows provider and model; identity fields stripped before sending.

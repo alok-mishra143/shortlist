@@ -23,7 +23,7 @@ jobs:
           - label: Windows x64
             os: windows-latest
           - label: Linux x64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,11 +48,15 @@ jobs:
           foreach ($file in @("scripts/package-windows.ps1", "scripts/fetch-model.ps1")) {
             $tokens = $null
             $errors = $null
+            $path = (Resolve-Path -LiteralPath $file).Path
             [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $file).Path, [ref]$tokens, [ref]$errors
+              $path, [ref]$tokens, [ref]$errors
             )
-            if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Error "$file: $_" }
+            # "${file}" needs braces: "$file:" parses as a scope qualifier and is a
+            # syntax error. Write-Host keeps GitHub's $ErrorActionPreference=Stop
+            # from aborting on the first problem so every parse error is reported.
+            foreach ($parseError in $errors) {
+              Write-Host "::error file=$file,line=$($parseError.Extent.StartLineNumber)::$($parseError.Message)"
               $failed = $true
             }
           }
