@@ -1301,7 +1301,25 @@ fn default_model(models: &[ModelRef]) -> Option<ModelRef> {
 }
 
 impl Render for ShortlistApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar_width = if self.sidebar_open {
+            SIDEBAR_WIDTH_OPEN
+        } else {
+            SIDEBAR_WIDTH_CLOSED
+        };
+        let room = (f32::from(window.viewport_size().width) - sidebar_width).max(0.);
+        let detail_open = self.selected_candidate.is_some();
+        // Keep a usable list beside the drawer. When the window is narrower
+        // than that, the drawer takes the content area on its own instead of
+        // squeezing the list or spilling past the window edge.
+        let side_by_side = room >= DETAIL_MIN_WIDTH + LIST_MIN_WIDTH;
+        let detail_width = if side_by_side {
+            DETAIL_WIDTH.min(room - LIST_MIN_WIDTH)
+        } else {
+            room
+        };
+        let detail = |this: &Self, cx: &mut Context<Self>| this.candidate_detail(detail_width, cx);
+
         div()
             .size_full()
             .flex()
@@ -1315,19 +1333,27 @@ impl Render for ShortlistApp {
                     .flex_1()
                     .h_full()
                     .min_w(px(0.))
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(self.update_banner(cx))
-                    .child(match self.route {
-                        Route::Candidates => self.candidates_view(cx).into_any_element(),
-                        Route::Chat => self.chat_view(cx).into_any_element(),
-                        Route::Developer => self.developer_view(cx).into_any_element(),
-                        Route::Settings => self.settings_view(cx).into_any_element(),
+                    .child(if detail_open && !side_by_side {
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .child(detail(self, cx))
+                            .into_any_element()
+                    } else {
+                        match self.route {
+                            Route::Candidates => self.candidates_view(cx).into_any_element(),
+                            Route::Chat => self.chat_view(cx).into_any_element(),
+                            Route::Developer => self.developer_view(cx).into_any_element(),
+                            Route::Settings => self.settings_view(cx).into_any_element(),
+                        }
                     }),
             )
-            .when(self.selected_candidate.is_some(), |el| {
-                el.child(self.candidate_detail(cx))
-            })
+            .when(detail_open && side_by_side, |el| el.child(detail(self, cx)))
     }
 }
 
@@ -1853,6 +1879,7 @@ impl ShortlistApp {
                 "sidebar-closed"
             })
             .h_full()
+            .flex_none()
             .overflow_hidden()
             .flex()
             .flex_col()
@@ -1902,9 +1929,9 @@ impl ShortlistApp {
                 Animation::new(Duration::from_millis(220)),
                 move |el, t| {
                     let width = if open {
-                        76.0 + 148.0 * t
+                        SIDEBAR_WIDTH_CLOSED + (SIDEBAR_WIDTH_OPEN - SIDEBAR_WIDTH_CLOSED) * t
                     } else {
-                        224.0 - 148.0 * t
+                        SIDEBAR_WIDTH_OPEN - (SIDEBAR_WIDTH_OPEN - SIDEBAR_WIDTH_CLOSED) * t
                     };
                     el.w(px(width))
                 },
@@ -2807,7 +2834,7 @@ impl ShortlistApp {
             .into_any_element()
     }
 
-    fn candidate_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn candidate_detail(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(c) = self
             .selected_candidate
             .as_ref()
@@ -2857,13 +2884,14 @@ impl ShortlistApp {
         div()
             .id("candidate-detail")
             .h_full()
+            .flex_none()
             .overflow_hidden()
             .bg(rgb(self.palette.card))
             .border_l_1()
             .border_color(rgb(self.palette.border))
             .child(
                 div()
-                    .w(px(430.))
+                    .w(px(width))
                     .h_full()
                     .flex()
                     .flex_col()
@@ -2884,11 +2912,15 @@ impl ShortlistApp {
                                     .gap_4()
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
                                             .flex()
                                             .items_center()
                                             .gap_3()
                                             .child(
                                                 div()
+                                                    .flex_none()
                                                     .size(px(54.))
                                                     .rounded_full()
                                                     .bg(rgb(self.palette.accent_soft))
@@ -2904,6 +2936,8 @@ impl ShortlistApp {
                                             )
                                             .child(
                                                 div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
                                                     .flex()
                                                     .flex_col()
                                                     .gap_1()
@@ -2915,12 +2949,20 @@ impl ShortlistApp {
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
                                                             .text_xl()
                                                             .font_weight(FontWeight::SEMIBOLD)
                                                             .child(c.name.clone()),
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
                                                             .text_sm()
                                                             .text_color(rgb(self.palette.muted))
                                                             .child(c.headline.clone()),
@@ -2930,6 +2972,7 @@ impl ShortlistApp {
                                     .child(
                                         div()
                                             .id("close-detail")
+                                            .flex_none()
                                             .p_1()
                                             .rounded_md()
                                             .child(
@@ -3242,7 +3285,7 @@ impl ShortlistApp {
             .with_animation(
                 "candidate-detail-anim",
                 Animation::new(Duration::from_millis(240)),
-                |el, t| el.w(px(430. * t)),
+                move |el, t| el.w(px(width * t)),
             )
             .into_any_element()
     }
@@ -3496,6 +3539,7 @@ impl ShortlistApp {
         div()
             .w(px(236.))
             .h_full()
+            .flex_none()
             .flex()
             .flex_col()
             .gap_3()
@@ -5620,6 +5664,15 @@ fn is_short_value(cell: &str) -> bool {
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '#' | '-' | '—' | '.' | '%' | '+'))
 }
 
+// Shared shell metrics. The sidebar keeps a fixed width, and the candidate
+// drawer only shrinks into the content area when the window has no room left
+// for the list beside it.
+const SIDEBAR_WIDTH_OPEN: f32 = 224.;
+const SIDEBAR_WIDTH_CLOSED: f32 = 76.;
+const DETAIL_WIDTH: f32 = 430.;
+const DETAIL_MIN_WIDTH: f32 = 300.;
+const LIST_MIN_WIDTH: f32 = 280.;
+
 // Shared candidate-table metrics. Header and rows read the same values, so
 // columns stay aligned at any window width. `Skills` is the only fluid column.
 const TABLE_AVATAR: f32 = 40.;
@@ -6376,6 +6429,9 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Below this the shell has no room for the sidebar, the candidate
+            // list, and the detail drawer, and dialogs start to clip.
+            window_min_size: Some(size(px(780.), px(560.))),
             titlebar: Some(TitlebarOptions {
                 title: Some("Shortlist".into()),
                 ..Default::default()
