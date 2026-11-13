@@ -15,13 +15,16 @@ macOS, Windows, and Linux all run the same updater. macOS replaces a
 
 ## First install
 
-Download the archive for your system from **GitHub → Releases**:
+Download the installer for your system from **GitHub → Releases**:
 
-| System | Asset | After extracting |
+| System | Installer | Portable / update archive |
 |:--|:--|:--|
-| Apple Silicon | `Shortlist-macos-aarch64.zip` | Move `Shortlist.app` to Applications |
-| Windows x64 | `Shortlist-windows-x86_64.zip` | Extract the `Shortlist` folder and run `shortlist.exe` |
-| Linux x64 | `Shortlist-linux-x86_64.zip` | Extract the `Shortlist` folder and run `./shortlist` |
+| Apple Silicon | `Shortlist-macos-aarch64.dmg` — open it and drag `Shortlist.app` to Applications | `Shortlist-macos-aarch64.zip` |
+| Windows x64 | `Shortlist-windows-x86_64-setup.exe` — per-user install with a Start Menu shortcut and uninstaller | `Shortlist-windows-x86_64.zip` |
+| Linux x64 | — | `Shortlist-linux-x86_64.zip` — extract `Shortlist/` and run `./shortlist` |
+
+The DMG and setup executable are first-install formats. Automatic updates use
+the `.zip` archives, which the app downloads, verifies, and unpacks in place.
 
 Intel Macs are not built: ONNX Runtime publishes no x86_64 macOS binary, so
 the encoder cannot be linked for them. An Intel Mac sees the release notes but

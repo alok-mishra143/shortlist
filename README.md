@@ -74,6 +74,10 @@ Counts and lookups run locally; **tool payloads are 80–93% smaller** than the 
 SHORTLIST_DEMO=1 ./scripts/run.sh   # demo library
 ```
 
+No toolchain? Download the [latest release](https://github.com/alok-mishra143/shortlist/releases/latest):
+**DMG** for Apple Silicon, **setup.exe** for Windows, **zip** for Linux. The zips
+double as the in-app update format.
+
 Rust stable · macOS 13+ (Apple Silicon) · [OpenCode](https://opencode.ai) for AI features.
 Installed builds update themselves from [GitHub Releases](docs/updates.md).
 
@@ -81,9 +85,9 @@ Installed builds update themselves from [GitHub Releases](docs/updates.md).
 <summary><b>Package & release</b></summary>
 
 ```bash
-./scripts/package-macos.sh              # Shortlist.app + zip
+./scripts/package-macos.sh              # Shortlist.app + dmg + zip
 ./scripts/package-linux.sh              # portable Shortlist/ + zip
-pwsh -File scripts/package-windows.ps1  # portable Shortlist/ + zip
+pwsh -File scripts/package-windows.ps1  # portable Shortlist/ + zip + setup.exe
 ./scripts/release.sh minor --push       # manual bump + publish
 ```
 
