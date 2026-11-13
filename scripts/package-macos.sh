@@ -2,8 +2,8 @@
 # Build and package Shortlist as a macOS .app bundle + release zip.
 #
 # The asset name must stay in sync with `shortlist_update::expected_asset_name`:
-#   Shortlist-macos-aarch64.zip  (Apple Silicon)
-#   Shortlist-macos-x86_64.zip   (Intel)
+#   Shortlist-macos-aarch64.zip  (Apple Silicon, the shipped build)
+# Intel Macs are not built because ONNX Runtime ships no x86_64 macOS binary.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

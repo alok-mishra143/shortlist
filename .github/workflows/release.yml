@@ -10,6 +10,12 @@ on:
         description: Tag to build and publish, for example v0.1.1.
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to rebuild, for example v0.1.1.
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -55,12 +61,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Apple Silicon
+          # Apple Silicon only: ONNX Runtime ships no x86_64 macOS binaries,
+          # so the prebuilt that `ort` downloads cannot be linked for Intel.
           - runner: macos-15
             arch: aarch64
-          # Intel
-          - runner: macos-15-intel
-            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -275,7 +279,6 @@ jobs:
           version="${TAG#v}"
           assets=(
             dist/Shortlist-macos-aarch64.zip
-            dist/Shortlist-macos-x86_64.zip
             dist/Shortlist-windows-x86_64.zip
             dist/Shortlist-linux-x86_64.zip
             dist/checksums.txt

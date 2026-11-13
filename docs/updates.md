@@ -20,9 +20,12 @@ Download the archive for your system from **GitHub → Releases**:
 | System | Asset | After extracting |
 |:--|:--|:--|
 | Apple Silicon | `Shortlist-macos-aarch64.zip` | Move `Shortlist.app` to Applications |
-| Intel Mac | `Shortlist-macos-x86_64.zip` | Move `Shortlist.app` to Applications |
 | Windows x64 | `Shortlist-windows-x86_64.zip` | Extract the `Shortlist` folder and run `shortlist.exe` |
 | Linux x64 | `Shortlist-linux-x86_64.zip` | Extract the `Shortlist` folder and run `./shortlist` |
+
+Intel Macs are not built: ONNX Runtime publishes no x86_64 macOS binary, so
+the encoder cannot be linked for them. An Intel Mac sees the release notes but
+the app reports that the release has no build for that machine.
 
 Keep the whole `Shortlist` folder together on Windows and Linux. The
 `shortlist-install.json` marker inside it is what lets the app update itself in
@@ -66,8 +69,8 @@ goes through GitHub Actions.
 
 1. bumps the workspace patch version in `Cargo.toml` and refreshes `Cargo.lock`,
 2. commits `Release vX.Y.Z`, creates an annotated tag, and pushes both,
-3. calls `.github/workflows/release.yml` to build macOS (Apple Silicon and
-   Intel), Windows x64, and Linux x64 from that tag, and
+3. calls `.github/workflows/release.yml` to build macOS (Apple Silicon),
+   Windows x64, and Linux x64 from that tag, and
 4. publishes a GitHub Release with every zip and one `checksums.txt`.
 
 Installed apps see the new release on their next check. The first release is
@@ -88,6 +91,9 @@ pushes the commit and tag. The tag triggers the same release workflow.
 Auto-release skips commits whose message starts with `Release v`, so the two
 paths never publish the same version twice.
 
+To rebuild a tag whose release failed, run **Actions → Release → Run workflow**
+with that tag; the build jobs check out the tag, not `main`.
+
 If Actions is unavailable, build on each target with the packaging scripts below
 and upload the zips plus a combined `checksums.txt` to the GitHub release
 yourself. The app only cares about the asset names and the checksum lines.
@@ -100,14 +106,13 @@ changing `crates/update/src/lib.rs`:
 | Asset | Purpose |
 |:--|:--|
 | `Shortlist-macos-aarch64.zip` | Apple Silicon build |
-| `Shortlist-macos-x86_64.zip` | Intel Mac build |
 | `Shortlist-windows-x86_64.zip` | Windows x64 portable build |
 | `Shortlist-linux-x86_64.zip` | Linux x64 portable build |
 | `checksums.txt` | SHA-256 lines for every zip |
 
-The ARM names (`Shortlist-windows-aarch64.zip`, `Shortlist-linux-aarch64.zip`)
-are understood by the updater, but the standard release workflow currently
-builds the four assets above.
+The other architecture names (`Shortlist-macos-x86_64.zip`,
+`Shortlist-windows-aarch64.zip`, `Shortlist-linux-aarch64.zip`) are understood
+by the updater, but the standard release workflow builds the three assets above.
 
 **macOS layout**
 

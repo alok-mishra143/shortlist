@@ -74,7 +74,7 @@ Counts and lookups run locally; **tool payloads are 80–93% smaller** than the 
 SHORTLIST_DEMO=1 ./scripts/run.sh   # demo library
 ```
 
-Rust stable · macOS 13+ · [OpenCode](https://opencode.ai) for AI features.
+Rust stable · macOS 13+ (Apple Silicon) · [OpenCode](https://opencode.ai) for AI features.
 Installed builds update themselves from [GitHub Releases](docs/updates.md).
 
 <details>
