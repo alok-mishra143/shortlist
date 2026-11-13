@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Cut a Shortlist release: bump the workspace version, commit, tag, and
-# optionally push. Pushing the tag builds both macOS assets on GitHub Actions
-# and publishes them; installed apps then see the update on their next check.
+# Cut a Shortlist release by hand: bump the workspace version, commit, tag, and
+# optionally push. Pushing the tag builds the macOS, Windows, and Linux assets
+# on GitHub Actions and publishes them; installed apps then see the update on
+# their next check.
+#
+# Pushing to main already cuts a patch release automatically
+# (.github/workflows/auto-release.yml); use this script for minor or major
+# bumps, or when you need to control the version.
 #
 #   ./scripts/release.sh patch
 #   ./scripts/release.sh minor --push

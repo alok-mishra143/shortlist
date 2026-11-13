@@ -84,8 +84,11 @@ Installed builds update themselves from [GitHub Releases](docs/updates.md).
 ./scripts/package-macos.sh              # Shortlist.app + zip
 ./scripts/package-linux.sh              # portable Shortlist/ + zip
 pwsh -File scripts/package-windows.ps1  # portable Shortlist/ + zip
-./scripts/release.sh patch --push       # tag + publish
+./scripts/release.sh minor --push       # manual bump + publish
 ```
+
+Pushing to `main` auto-releases a new patch build; `release.sh` is for
+minor/major bumps or a hand-cut release. See [docs/updates.md](docs/updates.md).
 
 </details>
 

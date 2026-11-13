@@ -58,30 +58,35 @@ Settings. Downloads can be cancelled.
 ## Cutting a release
 
 The updater installs built artifacts, not source commits. A release therefore
-goes through GitHub Actions:
+goes through GitHub Actions.
 
-```bash
-# after your changes are committed and pushed
-./scripts/release.sh patch --push     # or minor / major
-```
+### Automatic, on every push to `main`
 
-`release.sh`:
+`.github/workflows/auto-release.yml`:
 
-1. bumps the workspace version in `Cargo.toml` and refreshes `Cargo.lock`,
-2. commits `Release vX.Y.Z` and creates an annotated tag,
-3. pushes the commit and tag.
-
-The tag triggers `.github/workflows/release.yml`, which:
-
-1. checks that the tag matches the workspace version,
-2. builds on macOS (Apple Silicon and Intel), Windows x64, and Linux x64,
-3. packages each platform, writes SHA-256 checksums, and
+1. bumps the workspace patch version in `Cargo.toml` and refreshes `Cargo.lock`,
+2. commits `Release vX.Y.Z`, creates an annotated tag, and pushes both,
+3. calls `.github/workflows/release.yml` to build macOS (Apple Silicon and
+   Intel), Windows x64, and Linux x64 from that tag, and
 4. publishes a GitHub Release with every zip and one `checksums.txt`.
 
-Installed apps see the new release on their next check. The script bumps the
-version first, so the first published release is normally `v0.1.1` even though
-the working tree started at `0.1.0`; that is what makes existing installs see an
-update.
+Installed apps see the new release on their next check. The first release is
+normally `v0.1.1` even though the working tree started at `0.1.0`; that is what
+makes existing installs see an update.
+
+Pushing to `main` needs the workflow token to push a commit and tag. If `main`
+gets branch protection, allow `github-actions[bot]` to bypass it.
+
+### By hand, for minor or major bumps
+
+```bash
+./scripts/release.sh minor --push     # or major / patch
+```
+
+`release.sh` bumps the version it is told to, commits `Release vX.Y.Z`, and
+pushes the commit and tag. The tag triggers the same release workflow.
+Auto-release skips commits whose message starts with `Release v`, so the two
+paths never publish the same version twice.
 
 If Actions is unavailable, build on each target with the packaging scripts below
 and upload the zips plus a combined `checksums.txt` to the GitHub release

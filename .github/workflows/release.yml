@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and publish, for example v0.1.1.
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -18,14 +24,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Tag must match the workspace version
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${tag#v}"
           if [ "$version" != "$tag" ]; then
-            echo "::error::Cargo.toml says $version but the tag says $GITHUB_REF_NAME. Bump the version first."
+            echo "::error::Cargo.toml says $version but the tag says $tag. Bump the version first."
             exit 1
           fi
           echo "Releasing Shortlist $version"
@@ -55,6 +64,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -104,6 +115,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -191,6 +204,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Linux build dependencies
         run: ./scripts/install-linux-deps.sh
@@ -246,17 +261,18 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cat *.zip.sha256 > checksums.txt
-          rm -f *.zip.sha256
+          cat ./*.zip.sha256 > checksums.txt
+          rm -f ./*.zip.sha256
           cat checksums.txt
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           assets=(
             dist/Shortlist-macos-aarch64.zip
             dist/Shortlist-macos-x86_64.zip
@@ -264,12 +280,12 @@ jobs:
             dist/Shortlist-linux-x86_64.zip
             dist/checksums.txt
           )
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          if gh release view "$TAG" >/dev/null 2>&1; then
             # Re-running a failed publish should replace the assets, not fail.
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
-            gh release edit "$GITHUB_REF_NAME" --latest
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --latest
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$TAG" \
               --title "Shortlist $version" \
               --generate-notes \
               --latest \
