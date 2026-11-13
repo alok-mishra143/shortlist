@@ -1,3 +1,7 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,15 +13,21 @@ use gpui_kit::component::{Icon, IconName, Theme, ThemeMode, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use gpui_kit::{Animation, AnimationExt, FontWeight};
+use markdown_table::{Alignment, Table};
 use markdown_tools::{BlockKind, TextEdit};
 use shortlist_ai::OpenCode;
 use shortlist_core::{Candidate, ChatMessage, ChatSession, ModelRef, human_relative, now_ms};
 use shortlist_embed::Embedder;
 use shortlist_parse::parse_resume;
-use shortlist_pipeline::{build_context, build_prompt};
-use shortlist_store::Store;
+use shortlist_store::{DbTable, Store};
+use shortlist_update::{CheckResult, ReleaseInfo};
 
+mod markdown_table;
 mod markdown_tools;
+
+// GPUI does not infer a pointer cursor from `on_click`, so every clickable
+// surface below sets `.cursor_pointer()` explicitly; disabled actions use
+// `.cursor_not_allowed()` so the cursor matches what the click will do.
 
 struct ImportProgress {
     total: usize,
@@ -27,11 +37,62 @@ struct ImportProgress {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct ToolView {
+    lines: Vec<String>,
+    done: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
     Candidates,
     Chat,
+    Developer,
     Settings,
+}
+
+enum UpdatePhase {
+    Idle,
+    Checking,
+    Current {
+        latest: String,
+    },
+    Available(ReleaseInfo),
+    Downloading {
+        release: ReleaseInfo,
+        received: u64,
+        total: Option<u64>,
+    },
+    Installing {
+        version: String,
+    },
+    Failed {
+        message: String,
+        release: Option<ReleaseInfo>,
+    },
+}
+
+impl UpdatePhase {
+    fn busy(&self) -> bool {
+        matches!(
+            self,
+            UpdatePhase::Checking
+                | UpdatePhase::Downloading { .. }
+                | UpdatePhase::Installing { .. }
+        )
+    }
+
+    fn release(&self) -> Option<&ReleaseInfo> {
+        match self {
+            UpdatePhase::Available(release)
+            | UpdatePhase::Downloading { release, .. }
+            | UpdatePhase::Failed {
+                release: Some(release),
+                ..
+            } => Some(release),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +150,24 @@ impl Palette {
     }
 }
 
+/// A table cell is either a muted header label or body content, and it
+/// inherits the column alignment declared by the Markdown separator row.
+#[derive(Clone, Copy)]
+enum TableCellKind {
+    Header(Alignment),
+    Body(Alignment),
+}
+
+/// Status phrases for the indeterminate model call. A long reasoning turn
+/// cycles them so the bubble reads as active work, not a frozen card.
+const WORKING_PHRASES: [&str; 5] = [
+    "Cooking your answer",
+    "Finding your answer",
+    "Reading the evidence",
+    "Checking the shortlist",
+    "Writing it up",
+];
+
 struct ShortlistApp {
     route: Route,
     store: Arc<Store>,
@@ -104,6 +183,7 @@ struct ShortlistApp {
     embedder: Arc<Mutex<Option<Arc<Embedder>>>>,
     opencode: String,
     index_status: String,
+    mcp_status: Option<String>,
     busy: bool,
     notice: Option<String>,
     confirm_clear: bool,
@@ -116,6 +196,15 @@ struct ShortlistApp {
     selected_candidate: Option<String>,
     reextracting: Option<String>,
     streaming: Option<String>,
+    dev_table: String,
+    dev_tables: Vec<(String, i64)>,
+    dev_data: Option<DbTable>,
+    update_phase: UpdatePhase,
+    update_packaged: bool,
+    update_auto: bool,
+    update_checked_at: Option<i64>,
+    update_banner_hidden: bool,
+    update_cancel: Arc<AtomicBool>,
     _subs: Vec<Subscription>,
 }
 
@@ -166,6 +255,7 @@ impl ShortlistApp {
         });
         let route = match std::env::var("SHORTLIST_ROUTE").ok().as_deref() {
             Some("chat") => Route::Chat,
+            Some("developer") => Route::Developer,
             Some("settings") => Route::Settings,
             _ => Route::Candidates,
         };
@@ -181,6 +271,20 @@ impl ShortlistApp {
             apply_dark_surfaces(cx);
         }
         let sidebar_open = store.get_setting("sidebar_open").ok().flatten().as_deref() != Some("0");
+        let dev_tables = store.table_counts().unwrap_or_default();
+        let dev_data = store.inspect_table("candidates", 60).ok();
+        let update_packaged = shortlist_update::is_packaged_install();
+        let update_auto = store
+            .get_setting("auto_update_check")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
+        let update_checked_at = store
+            .get_setting("update_checked_at")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse().ok());
 
         let app = Self {
             route,
@@ -197,6 +301,7 @@ impl ShortlistApp {
             embedder: Arc::new(Mutex::new(None)),
             opencode: "Checking OpenCode…".into(),
             index_status: "Semantic index not built".into(),
+            mcp_status: None,
             busy: false,
             notice: None,
             confirm_clear: false,
@@ -209,6 +314,15 @@ impl ShortlistApp {
             selected_candidate: None,
             reextracting: None,
             streaming: None,
+            dev_table: "candidates".into(),
+            dev_tables,
+            dev_data,
+            update_phase: UpdatePhase::Idle,
+            update_packaged,
+            update_auto,
+            update_checked_at,
+            update_banner_hidden: false,
+            update_cancel: Arc::new(AtomicBool::new(false)),
             _subs: vec![search_sub, composer_sub],
         };
         cx.defer_in(window, |this, _window, cx| {
@@ -233,6 +347,17 @@ impl ShortlistApp {
             cx.defer_in(window, |this, window, cx| {
                 this.open_model_dialog(window, cx);
             });
+        }
+
+        if update_auto {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(2200))
+                    .await;
+                this.update(cx, |this, cx| this.check_for_updates(false, cx))
+                    .ok();
+            })
+            .detach();
         }
 
         if let Ok(prompt) = std::env::var("SHORTLIST_SMOKE_CHAT") {
@@ -297,6 +422,34 @@ impl ShortlistApp {
                 Err(e) => {
                     this.opencode = format!("OpenCode unavailable · {e}");
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn register_mcp(&mut self, cx: &mut Context<Self>) {
+        if mcp_binary().is_none() {
+            self.mcp_status = Some(
+                "shortlist-mcp is not built. Run `cargo build -p shortlist-mcp` first.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.mcp_status = Some("Registering Shortlist tools with OpenCode…".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ensure_mcp_registered() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mcp_status = Some(match result {
+                    Ok(true) => "Shortlist MCP tools registered with OpenCode.".into(),
+                    Ok(false) => "Shortlist MCP tools are already registered.".into(),
+                    Err(error) => format!("MCP tools not registered: {error}"),
+                });
+                cx.notify();
             })
             .ok();
         })
@@ -514,7 +667,7 @@ impl ShortlistApp {
                 })
                 .ok();
 
-                let chunks = shortlist_core::chunk_text(&candidate.text, 180, 28);
+                let chunks = shortlist_core::chunk_text(&candidate.index_text(), 180, 28);
                 let store_for_task = store.clone();
                 let embedder_for_task = embedder.clone();
                 let result = cx
@@ -579,6 +732,9 @@ impl ShortlistApp {
                     )
                 });
                 this.reload_candidates(cx);
+                // The drawer, note lookup, and chat chips read from the full
+                // library, so a newly imported candidate must land there too.
+                this.reload_library(cx);
                 cx.notify();
             })
             .ok();
@@ -628,21 +784,17 @@ impl ShortlistApp {
     }
 
     fn new_chat(&mut self, cx: &mut Context<Self>) {
-        let model = self.selected_model.clone();
-        match OpenCode.create_session("New chat", model.as_ref()) {
-            Ok(opencode_id) => match self.store.create_session("New chat") {
-                Ok(session) => {
-                    let _ = self
-                        .store
-                        .set_session_opencode_id(&session.id, &opencode_id);
-                    self.active_session = Some(session.id.clone());
-                    self.messages.clear();
-                    self.notice = None;
-                    self.reload_sessions(cx);
-                }
-                Err(e) => self.notice = Some(e.to_string()),
-            },
-            Err(e) => self.notice = Some(format!("Could not start a chat: {e}")),
+        // The harness owns model sessions and creates one per call, so a chat is
+        // a local row only. That keeps New chat instant and lets local lookups
+        // work with no OpenCode service at all.
+        match self.store.create_session("New chat") {
+            Ok(session) => {
+                self.active_session = Some(session.id.clone());
+                self.messages.clear();
+                self.notice = None;
+                self.reload_sessions(cx);
+            }
+            Err(e) => self.notice = Some(e.to_string()),
         }
         cx.notify();
     }
@@ -724,15 +876,14 @@ impl ShortlistApp {
                 }
             }
         };
-        let session = match self.sessions.iter().find(|s| s.id == local_id) {
-            Some(s) => s.clone(),
-            None => return,
-        };
-        if session.opencode_id.is_empty() {
-            self.notice = Some("The chat is still being created. Try again in a second.".into());
-            cx.notify();
-            return;
-        }
+        // History before this turn; the harness compacts it to a few short lines.
+        let history: Vec<(String, String)> = self
+            .store
+            .messages(&local_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| (message.role, message.text))
+            .collect();
         let _ = self.store.add_message(&local_id, "user", &text);
         if let Some(session) = self.sessions.iter().find(|s| s.id == local_id) {
             if session.title == "New chat" {
@@ -747,31 +898,37 @@ impl ShortlistApp {
 
         self.busy = true;
         self.streaming = Some(String::new());
-        self.notice = Some("Thinking…".into());
+        self.notice = Some("Cooking your answer…".into());
         let store = self.store.clone();
         let embedder = self.embedder.lock().unwrap().clone();
-        let sid = session.opencode_id.clone();
         let local = local_id.clone();
         let model = self.selected_model.clone();
         let query = text.clone();
-        let stream_state = Arc::new(Mutex::new(shortlist_ai::StreamState::default()));
+        let progress = Arc::new(Mutex::new(ToolView::default()));
+        let task_progress = progress.clone();
 
-        let state_for_task = stream_state.clone();
         let task = cx.background_executor().spawn(async move {
-            if let Some(model) = &model {
-                let _ = OpenCode.set_model(&sid, model);
-            }
-            let context = build_context(&store, embedder.as_deref(), &query, 4);
-            let prompt = build_prompt(&context, &query);
-            let result = OpenCode.stream_prompt(&sid, &prompt, state_for_task.clone());
-            if let Err(e) = &result {
-                let mut snapshot = state_for_task.lock().unwrap();
-                snapshot.done = true;
-                if snapshot.error.is_none() {
-                    snapshot.error = Some(e.to_string());
+            let callback_progress = task_progress.clone();
+            let progress_line = move |line: &str| {
+                if let Ok(mut view) = callback_progress.lock() {
+                    view.lines.push(format!("↳ {line}"));
+                    if view.lines.len() > 8 {
+                        view.lines.remove(0);
+                    }
                 }
+            };
+            let result = shortlist_pipeline::ask_with_tools_report(
+                &store,
+                embedder.as_deref(),
+                model.as_ref(),
+                &query,
+                &history,
+                Some(&progress_line),
+            );
+            if let Ok(mut view) = task_progress.lock() {
+                view.done = true;
             }
-            result
+            result.map(|report| (report.answer, report.direct))
         });
 
         cx.spawn(async move |this, cx| {
@@ -781,23 +938,27 @@ impl ShortlistApp {
                 cx.background_executor()
                     .timer(Duration::from_millis(120))
                     .await;
-                let snapshot = stream_state.lock().unwrap().clone();
-                if snapshot.text != last {
-                    last = snapshot.text.clone();
-                    let text = snapshot.text.clone();
+                let (text, done) = {
+                    let view = progress.lock().unwrap();
+                    (view.lines.join("\n"), view.done)
+                };
+                if text != last {
+                    last = text.clone();
                     this.update(cx, |this, cx| {
                         this.streaming = Some(text);
                         cx.notify();
                     })
                     .ok();
                 }
-                if snapshot.done {
+                if done {
                     break;
                 }
                 if now_ms() - started > 240_000 {
-                    let mut state = stream_state.lock().unwrap();
-                    state.done = true;
-                    state.error = Some("Timed out waiting for the model.".into());
+                    this.update(cx, |this, cx| {
+                        this.notice = Some("Timed out waiting for the model.".into());
+                        cx.notify();
+                    })
+                    .ok();
                     break;
                 }
             }
@@ -805,9 +966,13 @@ impl ShortlistApp {
             let result = task.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(answer) => {
+                    Ok((answer, direct)) => {
                         let _ = this.store.add_message(&local, "assistant", &answer);
-                        this.notice = None;
+                        this.notice = if direct {
+                            Some("Answered locally · no model call".into())
+                        } else {
+                            None
+                        };
                     }
                     Err(e) => {
                         let _ = this.store.add_message(
@@ -851,6 +1016,274 @@ impl ShortlistApp {
             Err(e) => self.notice = Some(e.to_string()),
         }
     }
+
+    fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update_phase.busy() {
+            return;
+        }
+        self.update_phase = UpdatePhase::Checking;
+        self.update_banner_hidden = false;
+        if manual {
+            self.notice = None;
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { shortlist_update::check_for_update() })
+                .await;
+            this.update(cx, |this, cx| {
+                let now = now_ms();
+                this.update_checked_at = Some(now);
+                let _ = this
+                    .store
+                    .set_setting("update_checked_at", &now.to_string());
+                this.update_phase = match result {
+                    Ok(CheckResult::UpToDate { latest, .. }) => UpdatePhase::Current {
+                        latest: latest.to_string(),
+                    },
+                    Ok(CheckResult::Available(release)) => UpdatePhase::Available(release),
+                    Err(error) => {
+                        if manual {
+                            UpdatePhase::Failed {
+                                message: format!("{error:#}"),
+                                release: None,
+                            }
+                        } else {
+                            // A quiet launch check should never nag when the
+                            // machine is offline. Settings still offers a
+                            // manual retry with the full error.
+                            UpdatePhase::Idle
+                        }
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn auto_install_ready(&self, release: &ReleaseInfo) -> bool {
+        self.update_packaged && release.asset.is_some() && release.checksums_url.is_some()
+    }
+
+    fn start_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_phase.busy() {
+            return;
+        }
+        let Some(release) = self.update_phase.release().cloned() else {
+            return;
+        };
+        if release.asset.is_none() {
+            self.notice =
+                Some("This release has no build for this Mac. Download it from GitHub.".into());
+            cx.notify();
+            return;
+        }
+        if release.checksums_url.is_none() {
+            self.notice =
+                Some("This release has no checksum file, so it must be installed manually.".into());
+            cx.notify();
+            cx.open_url(&release.page_url);
+            return;
+        }
+        if !self.update_packaged {
+            cx.open_url(&release.page_url);
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let background_cancel = cancel.clone();
+        self.update_cancel = cancel.clone();
+        let total_hint = release.asset.as_ref().map(|asset| asset.size);
+        self.update_phase = UpdatePhase::Downloading {
+            release: release.clone(),
+            received: 0,
+            total: total_hint,
+        };
+        self.update_banner_hidden = false;
+        self.notice = None;
+        cx.notify();
+
+        let progress = Arc::new(Mutex::new((0u64, total_hint, false)));
+        let background_progress = progress.clone();
+        let background_release = release.clone();
+        let work_root = shortlist_core::data_dir().join("updates");
+        let task = cx.background_executor().spawn(async move {
+            let mut on_progress = |received: u64, total: Option<u64>| {
+                if let Ok(mut value) = background_progress.lock() {
+                    value.0 = received;
+                    if total.is_some() {
+                        value.1 = total;
+                    }
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shortlist_update::download_and_stage(
+                    &background_release,
+                    &work_root,
+                    &background_cancel,
+                    &mut on_progress,
+                )
+            }))
+            .map_err(|_| "The updater stopped unexpectedly. Try again.".to_string())
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
+            if let Ok(mut value) = background_progress.lock() {
+                value.2 = true;
+            }
+            result
+        });
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let (received, total, done) = *progress.lock().unwrap();
+                this.update(cx, |this, cx| {
+                    if let UpdatePhase::Downloading {
+                        received: current,
+                        total: current_total,
+                        ..
+                    } = &mut this.update_phase
+                        && (*current != received || *current_total != total)
+                    {
+                        *current = received;
+                        *current_total = total;
+                        cx.notify();
+                    }
+                })
+                .ok();
+                if done {
+                    break;
+                }
+            }
+
+            let result = task.await;
+            if cancel.load(Ordering::Relaxed) {
+                if let Ok(staged) = &result {
+                    let _ = std::fs::remove_dir_all(&staged.work_dir);
+                }
+                this.update(cx, |this, cx| {
+                    this.update_phase = UpdatePhase::Available(release);
+                    this.notice = Some("Update cancelled.".into());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+
+            let staged = match result {
+                Ok(staged) => staged,
+                Err(message) => {
+                    this.update(cx, |this, cx| {
+                        this.update_phase = UpdatePhase::Failed {
+                            message,
+                            release: Some(release),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+
+            let version = staged.version.to_string();
+            this.update(cx, |this, cx| {
+                this.update_phase = UpdatePhase::Installing {
+                    version: version.clone(),
+                };
+                cx.notify();
+            })
+            .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+
+            let data_dir = shortlist_core::data_dir();
+            let install = cx
+                .background_executor()
+                .spawn(async move { shortlist_update::install_and_restart(&staged, &data_dir) })
+                .await;
+            match install {
+                Ok(()) => {
+                    this.update(cx, |_this, cx| cx.quit()).ok();
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    this.update(cx, |this, cx| {
+                        this.update_phase = UpdatePhase::Failed {
+                            message,
+                            release: Some(release),
+                        };
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
+        self.update_auto = !self.update_auto;
+        let _ = self.store.set_setting(
+            "auto_update_check",
+            if self.update_auto { "1" } else { "0" },
+        );
+        cx.notify();
+    }
+}
+
+fn platform_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
+fn arch_name() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "Apple Silicon",
+        ("macos", "x86_64") => "Intel",
+        (_, "aarch64") => "ARM64",
+        (_, "x86_64") => "x64",
+        (_, other) => other,
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn progress_summary(received: u64, total: Option<u64>) -> String {
+    match total.filter(|total| *total > 0) {
+        Some(total) => format!(
+            "{}% · {} of {}",
+            ((received as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u32,
+            human_bytes(received),
+            human_bytes(total)
+        ),
+        None => human_bytes(received),
+    }
+}
+
+fn progress_fraction(received: u64, total: Option<u64>) -> f32 {
+    total
+        .filter(|total| *total > 0)
+        .map(|total| (received as f32 / total as f32).clamp(0.0, 1.0))
+        .unwrap_or(0.0)
 }
 
 fn default_model(models: &[ModelRef]) -> Option<ModelRef> {
@@ -884,9 +1317,11 @@ impl Render for ShortlistApp {
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
+                    .child(self.update_banner(cx))
                     .child(match self.route {
                         Route::Candidates => self.candidates_view(cx).into_any_element(),
                         Route::Chat => self.chat_view(cx).into_any_element(),
+                        Route::Developer => self.developer_view(cx).into_any_element(),
                         Route::Settings => self.settings_view(cx).into_any_element(),
                     }),
             )
@@ -897,6 +1332,517 @@ impl Render for ShortlistApp {
 }
 
 impl ShortlistApp {
+    fn update_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.update_banner_hidden {
+            return div().into_any_element();
+        }
+
+        let (title, detail) = match &self.update_phase {
+            UpdatePhase::Available(release) => (
+                format!("Shortlist {} is available", release.version),
+                if self.auto_install_ready(release) {
+                    format!(
+                        "You're on {}. It downloads, installs, and reopens automatically.",
+                        shortlist_update::current_version()
+                    )
+                } else {
+                    "Download it from GitHub, or use a packaged build to install in place."
+                        .to_string()
+                },
+            ),
+            UpdatePhase::Downloading {
+                release,
+                received,
+                total,
+            } => (
+                format!("Downloading Shortlist {}…", release.version),
+                format!(
+                    "{} · Shortlist restarts when the update is ready.",
+                    progress_summary(*received, *total)
+                ),
+            ),
+            UpdatePhase::Installing { version } => (
+                format!("Installing Shortlist {version}…"),
+                "Shortlist is about to restart.".to_string(),
+            ),
+            UpdatePhase::Failed {
+                message,
+                release: Some(release),
+            } => (
+                format!("Couldn't update to {}", release.version),
+                message
+                    .lines()
+                    .next()
+                    .unwrap_or("Unknown update error")
+                    .to_string(),
+            ),
+            _ => return div().into_any_element(),
+        };
+
+        let actions: AnyElement = match &self.update_phase {
+            UpdatePhase::Available(release) if release.asset.is_some() => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.action_primary(
+                    "banner-update",
+                    if self.auto_install_ready(release) {
+                        "Update & restart"
+                    } else {
+                        "Download update"
+                    },
+                    cx,
+                ))
+                .child(self.action_ghost("banner-later", "Later", cx, |this, cx| {
+                    this.update_banner_hidden = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            UpdatePhase::Available(release) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.action_open("banner-release", "View release", &release.page_url, cx))
+                .child(self.action_ghost("banner-later", "Later", cx, |this, cx| {
+                    this.update_banner_hidden = true;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            UpdatePhase::Downloading { .. } => self
+                .action_ghost("banner-cancel", "Cancel", cx, |this, cx| {
+                    this.update_cancel.store(true, Ordering::Relaxed);
+                    cx.notify();
+                })
+                .into_any_element(),
+            UpdatePhase::Failed {
+                release: Some(release),
+                ..
+            } => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.action_primary("banner-retry", "Try again", cx))
+                .child(self.action_open("banner-notes", "Release notes", &release.page_url, cx))
+                .child(
+                    self.action_ghost("banner-dismiss", "Dismiss", cx, |this, cx| {
+                        this.update_banner_hidden = true;
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            _ => div().into_any_element(),
+        };
+
+        let progress = match &self.update_phase {
+            UpdatePhase::Downloading {
+                received, total, ..
+            } => Some(progress_fraction(*received, *total)),
+            _ => None,
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_8()
+            .py_3()
+            .bg(rgb(self.palette.accent_soft))
+            .border_b_1()
+            .border_color(rgb(self.palette.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                Icon::new(IconName::RefreshCw)
+                                    .text_color(rgb(self.palette.accent))
+                                    .w(px(16.))
+                                    .h(px(16.)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_ellipsis()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(self.palette.muted))
+                                            .text_ellipsis()
+                                            .child(detail),
+                                    ),
+                            ),
+                    )
+                    .child(actions),
+            )
+            .when_some(progress, |el, fraction| {
+                el.child(self.update_progress_bar(fraction))
+            })
+            .into_any_element()
+    }
+
+    fn update_progress_bar(&self, fraction: f32) -> impl IntoElement {
+        div()
+            .h(px(3.))
+            .w_full()
+            .rounded_full()
+            .bg(rgb(self.palette.chip))
+            .child(
+                div()
+                    .h_full()
+                    .rounded_full()
+                    .bg(rgb(self.palette.accent))
+                    .w(relative(fraction.clamp(0.02, 1.0))),
+            )
+    }
+
+    fn action_primary(&self, id: &'static str, label: &str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(id)
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(self.palette.accent))
+            .text_color(rgb(self.palette.on_accent))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .child(label.to_string())
+            .hover(|style| style.opacity(0.9))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.start_update(cx)))
+            .into_any_element()
+    }
+
+    fn action_ghost(
+        &self,
+        id: &'static str,
+        label: &str,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let hover = self.palette.hover;
+        div()
+            .id(id)
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(self.palette.border))
+            .bg(rgb(self.palette.card))
+            .text_xs()
+            .text_color(rgb(self.palette.ink))
+            .child(label.to_string())
+            .hover(move |style| style.bg(rgb(hover)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
+            .into_any_element()
+    }
+
+    fn action_open(
+        &self,
+        id: &'static str,
+        label: &str,
+        url: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let url = url.to_string();
+        self.action_ghost(id, label, cx, move |_this, cx| cx.open_url(&url))
+    }
+
+    fn update_check_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hover = self.palette.hover;
+        let busy = self.update_phase.busy();
+        div()
+            .id("settings-check-updates")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(self.palette.chip))
+            .text_xs()
+            .text_color(rgb(self.palette.ink))
+            .when(busy, |el| el.opacity(0.55))
+            .child(
+                Icon::new(IconName::RefreshCw)
+                    .text_color(rgb(self.palette.muted))
+                    .w(px(14.))
+                    .h(px(14.)),
+            )
+            .child(
+                if matches!(self.update_phase, UpdatePhase::Current { .. }) {
+                    "Check again"
+                } else {
+                    "Check for updates"
+                },
+            )
+            .hover(move |style| style.bg(rgb(hover)))
+            .when(busy, |el| el.cursor_not_allowed())
+            .when(!busy, |el| el.cursor_pointer())
+            .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(true, cx)))
+            .into_any_element()
+    }
+
+    fn update_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = shortlist_update::current_version().to_string();
+        let hover = self.palette.hover;
+        let (status, tone) = match &self.update_phase {
+            UpdatePhase::Idle => (
+                "Check GitHub for a newer release. Updates install in place and restart Shortlist."
+                    .to_string(),
+                self.palette.muted,
+            ),
+            UpdatePhase::Checking => (
+                "Checking GitHub for a newer release…".to_string(),
+                self.palette.accent,
+            ),
+            UpdatePhase::Current { latest } => (
+                format!("You're up to date. The latest release is {latest}."),
+                self.palette.success,
+            ),
+            UpdatePhase::Available(release) => (
+                format!(
+                    "Version {} is available. You're on {current}.",
+                    release.version
+                ),
+                self.palette.accent,
+            ),
+            UpdatePhase::Downloading {
+                release,
+                received,
+                total,
+            } => (
+                format!(
+                    "Downloading {} · {}",
+                    release.version,
+                    progress_summary(*received, *total)
+                ),
+                self.palette.accent,
+            ),
+            UpdatePhase::Installing { version } => (
+                format!("Installing {version} and restarting…"),
+                self.palette.accent,
+            ),
+            UpdatePhase::Failed { message, .. } => (message.clone(), self.palette.danger),
+        };
+
+        let release = self.update_phase.release().cloned();
+        let notes: Vec<String> = release
+            .as_ref()
+            .map(|release| {
+                release
+                    .notes
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .take(3)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let progress = match &self.update_phase {
+            UpdatePhase::Downloading {
+                received, total, ..
+            } => Some((*received, *total)),
+            _ => None,
+        };
+
+        let actions: AnyElement = match (&self.update_phase, release.as_ref()) {
+            (UpdatePhase::Available(release), Some(_)) if release.asset.is_some() => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(if self.auto_install_ready(release) {
+                    self.action_primary("settings-update", "Update & restart", cx)
+                } else {
+                    self.action_open(
+                        "settings-download",
+                        "Download from GitHub",
+                        &release.page_url,
+                        cx,
+                    )
+                })
+                .child(self.update_check_button(cx))
+                .into_any_element(),
+            (UpdatePhase::Available(release), _) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.action_open("settings-release", "View release", &release.page_url, cx))
+                .child(self.update_check_button(cx))
+                .into_any_element(),
+            (UpdatePhase::Downloading { .. }, _) => self
+                .action_ghost("settings-cancel-update", "Cancel update", cx, |this, cx| {
+                    this.update_cancel.store(true, Ordering::Relaxed);
+                    cx.notify();
+                })
+                .into_any_element(),
+            (
+                UpdatePhase::Failed {
+                    release: Some(release),
+                    ..
+                },
+                _,
+            ) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.action_primary("settings-retry", "Try again", cx))
+                .child(self.action_open(
+                    "settings-failed-notes",
+                    "Release notes",
+                    &release.page_url,
+                    cx,
+                ))
+                .into_any_element(),
+            (UpdatePhase::Installing { .. }, _) => div().into_any_element(),
+            _ => self.update_check_button(cx).into_any_element(),
+        };
+
+        div()
+            .p_5()
+            .rounded_lg()
+            .bg(rgb(self.palette.card))
+            .border_1()
+            .border_color(rgb(self.palette.border))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.section_header(
+                IconName::RefreshCw,
+                "Updates",
+                "New versions install from GitHub Releases",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("Shortlist v{current}")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(self.palette.muted))
+                                    .child(format!("{} · {}", platform_name(), arch_name())),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(rgb(tone)).child(status)),
+            )
+            .when_some(self.update_checked_at, |el, checked| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(self.palette.muted))
+                        .child(format!("Last checked {}.", human_relative(checked))),
+                )
+            })
+            .when_some(progress, |el, (received, total)| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(self.update_progress_bar(progress_fraction(received, total)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(self.palette.muted))
+                                .child(progress_summary(received, total)),
+                        ),
+                )
+            })
+            .when(!notes.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("What's new".to_string()),
+                        )
+                        .children(notes.into_iter().map(|line| {
+                            div()
+                                .text_xs()
+                                .text_color(rgb(self.palette.muted))
+                                .child(format!("· {line}"))
+                        })),
+                )
+            })
+            .child(actions)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .pt_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(self.palette.muted))
+                            .child("Check automatically when Shortlist opens".to_string()),
+                    )
+                    .child(
+                        div()
+                            .id("settings-auto-update")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(self.palette.chip))
+                            .text_xs()
+                            .text_color(rgb(self.palette.ink))
+                            .child(if self.update_auto { "On" } else { "Off" })
+                            .hover(move |style| style.bg(rgb(hover)))
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.toggle_auto_update(cx)),
+                            ),
+                    ),
+            )
+            .when(!self.update_packaged, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(self.palette.muted))
+                        .child(
+                            "This is a development build, so automatic install is unavailable. Packaged releases update in place."
+                                .to_string(),
+                        ),
+                )
+            })
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let collapsed = !self.sidebar_open;
         let open = self.sidebar_open;
@@ -926,8 +1872,26 @@ impl ShortlistApp {
                 cx,
             ))
             .child(self.nav_item("Chat", Route::Chat, None, IconName::Bot, cx))
+            .child(self.nav_item("Developer", Route::Developer, None, IconName::HardDrive, cx))
             .child(self.nav_item("Settings", Route::Settings, None, IconName::Settings, cx))
             .child(div().flex_1())
+            .when(!collapsed, |el| {
+                el.child(
+                    div()
+                        .id("sidebar-version")
+                        .px_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(rgb(self.palette.muted))
+                        .child(format!("v{}", shortlist_update::current_version()))
+                        .hover(|style| style.opacity(0.7))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.route = Route::Settings;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(self.theme_toggle(collapsed, cx))
             .with_animation(
                 if open {
@@ -948,6 +1912,7 @@ impl ShortlistApp {
     }
 
     fn brand_row(&self, collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.palette.hover;
         div()
             .flex()
             .items_center()
@@ -990,6 +1955,8 @@ impl ShortlistApp {
                         .w(px(16.))
                         .h(px(16.)),
                     )
+                    .hover(move |style| style.bg(rgb(hover)))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_open = !this.sidebar_open;
                         let _ = this
@@ -1010,6 +1977,8 @@ impl ShortlistApp {
     ) -> impl IntoElement {
         let active = self.route == route;
         let collapsed = !self.sidebar_open;
+        let hover = self.palette.hover;
+        let accent_soft = self.palette.accent_soft;
         let icon_color = if active {
             self.palette.accent
         } else {
@@ -1025,7 +1994,7 @@ impl ShortlistApp {
             .mb_1()
             .rounded_md()
             .bg(if active {
-                rgb(self.palette.accent_soft)
+                rgb(accent_soft)
             } else {
                 rgb(self.palette.sidebar)
             })
@@ -1063,13 +2032,20 @@ impl ShortlistApp {
                         .child(count.map(|c| c.to_string()).unwrap_or_default()),
                 )
             })
+            .hover(move |style| style.bg(if active { rgb(accent_soft) } else { rgb(hover) }))
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.route = route;
-                cx.notify();
+                if route == Route::Developer {
+                    this.load_dev(cx);
+                } else {
+                    cx.notify();
+                }
             }))
     }
 
     fn theme_toggle(&self, collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.palette.hover;
         div()
             .id("theme-toggle")
             .flex()
@@ -1103,6 +2079,8 @@ impl ShortlistApp {
                         .child(if self.dark { "Light mode" } else { "Dark mode" }),
                 )
             })
+            .hover(move |style| style.bg(rgb(hover)))
+            .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx)))
     }
 
@@ -1241,6 +2219,8 @@ impl ShortlistApp {
                                     .h(px(14.)),
                             )
                             .child("Import resumes")
+                            .hover(|style| style.opacity(0.9))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.import(window, cx);
                             }))
@@ -1391,6 +2371,8 @@ impl ShortlistApp {
                             .text_xs()
                             .text_color(rgb(self.palette.danger))
                             .child(if stopping { "Stopping…" } else { "Stop" })
+                            .hover(|style| style.opacity(0.8))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(progress) = &this.import {
                                     progress.cancel.store(true, Ordering::Relaxed);
@@ -1483,6 +2465,8 @@ impl ShortlistApp {
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .child("Import resumes")
+                    .hover(|style| style.opacity(0.9))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.import(window, cx);
                     })),
@@ -1713,6 +2697,7 @@ impl ShortlistApp {
                         .child(human_relative(c.created_at)),
                 )
             })
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_candidate = Some(select_id.clone());
                 cx.notify();
@@ -1759,6 +2744,8 @@ impl ShortlistApp {
                                 .text_xs()
                                 .text_color(rgb(self.palette.danger))
                                 .child("Delete")
+                                .hover(|style| style.opacity(0.8))
+                                .cursor_pointer()
                                 .on_click(cx.listener({
                                     let id = delete_id.clone();
                                     move |this, _, _, cx| {
@@ -1775,6 +2762,8 @@ impl ShortlistApp {
                                 .text_xs()
                                 .text_color(rgb(self.palette.muted))
                                 .child("Cancel")
+                                .hover(move |style| style.bg(rgb(hover)))
+                                .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_delete = None;
                                     cx.notify();
@@ -1797,6 +2786,8 @@ impl ShortlistApp {
                                         .w(px(14.))
                                         .h(px(14.)),
                                 )
+                                .hover(move |style| style.bg(rgb(hover)))
+                                .cursor_pointer()
                                 .on_click(cx.listener({
                                     let id = delete_id.clone();
                                     move |this, _, _, cx| {
@@ -1825,6 +2816,7 @@ impl ShortlistApp {
             return div().into_any_element();
         };
         let candidate_id = c.id.clone();
+        let hover = self.palette.hover;
         let reextracting = self.reextracting.as_deref() == Some(c.id.as_str());
         let summary = if c.summary.trim().is_empty() {
             "No summary extracted yet.".to_string()
@@ -1858,6 +2850,9 @@ impl ShortlistApp {
         };
         let added = human_relative(c.created_at);
         let skills = c.skills.clone();
+        let roles = c.experience.clone();
+        let education = c.education.clone();
+        let certifications = c.certifications.clone();
 
         div()
             .id("candidate-detail")
@@ -1943,6 +2938,8 @@ impl ShortlistApp {
                                                     .text_color(rgb(self.palette.muted))
                                                     .child("×"),
                                             )
+                                            .hover(move |style| style.bg(rgb(hover)))
+                                            .cursor_pointer()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.selected_candidate = None;
                                                 cx.notify();
@@ -1990,6 +2987,8 @@ impl ShortlistApp {
                                             } else {
                                                 "Re-read with AI"
                                             })
+                                            .hover(|style| style.opacity(0.9))
+                                            .cursor_pointer()
                                             .on_click(cx.listener({
                                                 let id = candidate_id.clone();
                                                 move |this, _, _, cx| {
@@ -2019,6 +3018,8 @@ impl ShortlistApp {
                                                     .h(px(14.)),
                                             )
                                             .child("Note")
+                                            .hover(move |style| style.bg(rgb(hover)))
+                                            .cursor_pointer()
                                             .on_click(cx.listener({
                                                 let id = candidate_id.clone();
                                                 move |this, _, window, cx| {
@@ -2032,7 +3033,7 @@ impl ShortlistApp {
                                     .text_xs()
                                     .text_color(rgb(self.palette.muted))
                                     .child(
-                                        "Notes stay on this device. AI re-read fixes name, role, skills, and location.",
+                                        "Notes stay on this device. Re-read extracts name, roles, education, and skills, then rebuilds the search embeddings.",
                                     ),
                             ),
                     )
@@ -2120,6 +3121,93 @@ impl ShortlistApp {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
+                                    .child(self.detail_label("Experience"))
+                                    .child(if roles.is_empty() {
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(self.palette.muted))
+                                            .child("No roles extracted yet. Use Re-read with AI.")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .children(roles.iter().map(|role| {
+                                                div()
+                                                    .p_3()
+                                                    .rounded_lg()
+                                                    .bg(rgb(self.palette.bg))
+                                                    .border_1()
+                                                    .border_color(rgb(self.palette.border))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .child(if role.title.is_empty() {
+                                                                "Role".to_string()
+                                                            } else {
+                                                                role.title.clone()
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(self.palette.muted))
+                                                            .child(role.label()),
+                                                    )
+                                                    .when(!role.description.is_empty(), |el| {
+                                                        el.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(self.palette.ink))
+                                                                .child(role.description.clone()),
+                                                        )
+                                                    })
+                                            }))
+                                            .into_any_element()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(self.detail_label("Education & certifications"))
+                                    .child(if education.is_empty() && certifications.is_empty() {
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(self.palette.muted))
+                                            .child("Nothing extracted yet.")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .children(education.iter().map(|item| {
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(self.palette.ink))
+                                                    .child(item.label())
+                                            }))
+                                            .children(certifications.iter().map(|item| {
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(self.palette.muted))
+                                                    .child(format!("Certification · {item}"))
+                                            }))
+                                            .into_any_element()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
                                     .child(self.detail_label("Resume text"))
                                     .child(
                                         div()
@@ -2201,6 +3289,64 @@ impl ShortlistApp {
             )
     }
 
+    /// Rebuild the chunk rows and their vectors after a note or profile edit.
+    /// Runs in the background; failures surface as a notice.
+    fn reindex_candidate(&mut self, id: String, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let embedder = self.embedder.lock().unwrap().clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let candidate = store
+                        .candidate(&id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "candidate not found".to_string())?;
+                    let note = store.note(&id).ok().flatten();
+                    let chunks = shortlist_core::chunk_text(
+                        &candidate.index_text_with_note(note.as_deref()),
+                        180,
+                        28,
+                    );
+                    let vectors = match &embedder {
+                        Some(embedder) => embedder
+                            .embed_passages(&chunks)
+                            .map_err(|error| format!("embedding failed: {error}"))?,
+                        None => Vec::new(),
+                    };
+                    store
+                        .save_chunks_with_vectors(
+                            &id,
+                            &chunks,
+                            &vectors,
+                            if vectors.is_empty() {
+                                ""
+                            } else {
+                                shortlist_embed::MODEL_ID
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok::<(), String>(())
+                })
+                .await;
+            if let Err(error) = result {
+                this.update(cx, |this, cx| {
+                    this.notice = Some(format!("Search index was not refreshed: {error}"));
+                    cx.notify();
+                })
+                .ok();
+            } else {
+                this.update(cx, |this, cx| {
+                    if this.route == Route::Developer {
+                        this.load_dev(cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn reextract_candidate(&mut self, id: String, cx: &mut Context<Self>) {
         if self.reextracting.is_some() {
             return;
@@ -2223,38 +3369,72 @@ impl ShortlistApp {
         cx.notify();
 
         let store = self.store.clone();
+        let embedder = self.embedder.lock().unwrap().clone();
         let text = candidate.text.clone();
         cx.spawn(async move |this, cx| {
-            let extracted = cx
+            let result = cx
                 .background_executor()
                 .spawn(async move {
-                    shortlist_ai::OpenCode
+                    let profile = shortlist_ai::OpenCode
                         .extract_profile(Some(&model), &text)
-                        .ok()
+                        .map_err(|error| format!("AI extraction failed: {error}"))?;
+                    let mut updated = candidate.clone();
+                    merge_extracted(&mut updated, profile);
+                    let note = store.note(&updated.id).ok().flatten();
+                    let chunks = shortlist_core::chunk_text(
+                        &updated.index_text_with_note(note.as_deref()),
+                        180,
+                        28,
+                    );
+                    if let Some(embedder) = embedder {
+                        match embedder.embed_passages(&chunks) {
+                            Ok(vectors) => {
+                                store
+                                    .update_candidate(&updated)
+                                    .map_err(|error| error.to_string())?;
+                                store
+                                    .save_chunks_with_vectors(
+                                        &updated.id,
+                                        &chunks,
+                                        &vectors,
+                                        shortlist_embed::MODEL_ID,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            Err(error) => {
+                                // Keep the refreshed profile even if the model
+                                // file disappeared; fall back to text chunks.
+                                store
+                                    .insert_candidate(&updated, &chunks)
+                                    .map_err(|error| error.to_string())?;
+                                return Err(format!("profile saved; embedding failed: {error}"));
+                            }
+                        }
+                    } else {
+                        store
+                            .insert_candidate(&updated, &chunks)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok::<usize, String>(chunks.len())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                match extracted {
-                    Some(profile) => {
-                        let mut updated = candidate.clone();
-                        merge_extracted(&mut updated, profile);
-                        match store.update_candidate(&updated) {
-                            Ok(()) => {
-                                this.notice = Some("Profile refreshed with AI.".into());
-                            }
-                            Err(error) => {
-                                this.notice = Some(format!("Could not save profile: {error}"));
-                            }
-                        }
+                match result {
+                    Ok(chunks) => {
+                        this.notice = Some(format!(
+                            "Profile refreshed with AI · {chunks} chunks rebuilt."
+                        ));
                     }
-                    None => {
-                        this.notice =
-                            Some("AI extraction failed; kept the existing profile.".into());
+                    Err(error) => {
+                        this.notice = Some(error);
                     }
                 }
                 this.reextracting = None;
                 this.reload_candidates(cx);
                 this.reload_library(cx);
+                if this.route == Route::Developer {
+                    this.load_dev(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -2307,10 +3487,12 @@ impl ShortlistApp {
                     .h(px(15.)),
             )
             .child("New chat")
+            .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
     }
 
     fn chat_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.palette.hover;
         div()
             .w(px(236.))
             .h_full()
@@ -2381,6 +3563,8 @@ impl ShortlistApp {
                                             .text_color(rgb(self.palette.muted))
                                             .child(human_relative(s.updated_at)),
                                     )
+                                    .hover(move |style| style.bg(rgb(hover)))
+                                    .cursor_pointer()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.select_session(select_id.clone(), cx);
                                     })),
@@ -2400,6 +3584,8 @@ impl ShortlistApp {
                                             .w(px(13.))
                                             .h(px(13.)),
                                     )
+                                    .hover(move |style| style.bg(rgb(hover)))
+                                    .cursor_pointer()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.delete_chat(id.clone(), cx);
                                     })),
@@ -2623,9 +3809,25 @@ impl ShortlistApp {
     }
 
     fn assistant_body(&self, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        let lines: Vec<&str> = text.lines().collect();
         let mut blocks: Vec<AnyElement> = Vec::new();
-        for raw in text.lines() {
-            let trimmed = raw.trim();
+        let mut index = 0;
+
+        while index < lines.len() {
+            let trimmed = lines[index].trim();
+
+            // A table is only a table when a separator row follows the header,
+            // so trying this on every pipe-containing line is safe.
+            if trimmed.contains('|')
+                && let Some((table, next)) = markdown_table::parse(&lines, index)
+            {
+                blocks.push(self.table_block(&table, cx));
+                index = next;
+                continue;
+            }
+
+            index += 1;
+
             if trimmed.is_empty() {
                 blocks.push(div().h(px(5.)).into_any_element());
                 continue;
@@ -2699,10 +3901,169 @@ impl ShortlistApp {
             .into_any_element()
     }
 
+    /// Renders a Markdown table as a bordered, zebra-striped grid. Columns are
+    /// sized from their content, so a long "Why" column stays readable while
+    /// rank and gap columns stay compact.
+    fn table_block(&self, table: &Table, cx: &mut Context<Self>) -> AnyElement {
+        let columns = table.header.len();
+        if columns == 0 {
+            return div().into_any_element();
+        }
+        let weights = self.table_column_weights(table);
+        let palette = self.palette;
+        let alignments: Vec<Alignment> = (0..columns)
+            .map(|column| {
+                table
+                    .alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(Alignment::Left)
+            })
+            .collect();
+
+        let mut header_cells = Vec::with_capacity(columns);
+        for column in 0..columns {
+            header_cells.push(self.table_cell(
+                weights[column],
+                table.header.get(column).map(String::as_str).unwrap_or(""),
+                TableCellKind::Header(alignments[column]),
+                column + 1 < columns,
+                cx,
+            ));
+        }
+        let header = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .bg(rgb(palette.chip))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .children(header_cells);
+
+        let mut rows = Vec::with_capacity(table.rows.len());
+        for (row_index, row) in table.rows.iter().enumerate() {
+            let mut cells = Vec::with_capacity(columns);
+            for column in 0..columns {
+                cells.push(self.table_cell(
+                    weights[column],
+                    row.get(column).map(String::as_str).unwrap_or(""),
+                    TableCellKind::Body(alignments[column]),
+                    column + 1 < columns,
+                    cx,
+                ));
+            }
+            rows.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_stretch()
+                    .when(row_index % 2 == 1, |el| el.bg(rgb(palette.chip)))
+                    .when(row_index + 1 < table.rows.len(), |el| {
+                        el.border_b_1().border_color(rgb(palette.border))
+                    })
+                    .children(cells)
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .w_full()
+            .my_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(header)
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn table_cell(
+        &self,
+        weight: f32,
+        text: &str,
+        kind: TableCellKind,
+        divider: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cell = div()
+            .flex_grow(weight)
+            .flex_basis(px(0.))
+            .min_w(px(0.))
+            .px_2()
+            .py_2()
+            .when(divider, |el| {
+                el.border_r_1().border_color(rgb(self.palette.border))
+            });
+
+        match kind {
+            TableCellKind::Header(align) => {
+                let label = div()
+                    .w_full()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(self.palette.muted))
+                    .child(plain_inline(text));
+                let label = match align {
+                    Alignment::Left => label.text_left(),
+                    Alignment::Center => label.text_center(),
+                    Alignment::Right => label.text_right(),
+                };
+                cell.child(label).into_any_element()
+            }
+            TableCellKind::Body(align) => cell
+                .child(self.rich_line_aligned(text, false, align, cx))
+                .into_any_element(),
+        }
+    }
+
+    /// Relative column widths: wider content earns more space, with a bump for
+    /// columns that render candidate chips and a cap for short value columns.
+    fn table_column_weights(&self, table: &Table) -> Vec<f32> {
+        table
+            .column_widths()
+            .into_iter()
+            .enumerate()
+            .map(|(column, width)| {
+                let mut weight = 10.0 + (width.min(400) as f32).sqrt() * 5.0;
+                if table
+                    .rows
+                    .iter()
+                    .all(|row| is_short_value(row.get(column).map(String::as_str).unwrap_or("")))
+                {
+                    weight = weight.min(18.0);
+                }
+                let has_candidate = table.rows.iter().any(|row| {
+                    row.get(column).is_some_and(|cell| {
+                        !shortlist_core::candidate_spans(&self.library_candidates, cell).is_empty()
+                    })
+                });
+                if has_candidate {
+                    weight = weight.max(34.0);
+                }
+                weight.clamp(14.0, 72.0)
+            })
+            .collect()
+    }
+
     fn rich_line(&self, text: &str, heading: bool, cx: &mut Context<Self>) -> AnyElement {
+        self.rich_line_aligned(text, heading, Alignment::Left, cx)
+    }
+
+    fn rich_line_aligned(
+        &self,
+        text: &str,
+        heading: bool,
+        align: Alignment,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let spans = shortlist_core::candidate_spans(&self.library_candidates, text);
         if spans.is_empty() {
-            let cleaned = text.replace("**", "").replace('`', "").replace('*', "");
+            let cleaned = plain_inline(text);
             let element = if heading {
                 div()
                     .text_base()
@@ -2715,6 +4076,12 @@ impl ShortlistApp {
                     .text_color(rgb(self.palette.ink))
                     .child(cleaned)
             };
+            let element = element.w_full();
+            let element = match align {
+                Alignment::Left => element.text_left(),
+                Alignment::Center => element.text_center(),
+                Alignment::Right => element.text_right(),
+            };
             return element.into_any_element();
         }
         let mut fragments: Vec<AnyElement> = Vec::new();
@@ -2726,21 +4093,25 @@ impl ShortlistApp {
             last = span.end;
         }
         self.push_words(&mut fragments, &text[last..], heading, &mut bold);
-        div()
+        let row = div()
             .w_full()
             .flex()
             .flex_row()
             .flex_wrap()
             .items_center()
-            .gap_1()
-            .children(fragments)
-            .into_any_element()
+            .gap_1();
+        let row = match align {
+            Alignment::Left => row.justify_start(),
+            Alignment::Center => row.justify_center(),
+            Alignment::Right => row.justify_end(),
+        };
+        row.children(fragments).into_any_element()
     }
 
     fn push_words(&self, out: &mut Vec<AnyElement>, text: &str, heading: bool, bold: &mut bool) {
         let mut parts = text.split("**").peekable();
         while let Some(part) = parts.next() {
-            let cleaned = part.replace('`', "").replace('*', "");
+            let cleaned = plain_inline(part);
             for word in cleaned.split_whitespace() {
                 let mut element = div().child(word.to_string());
                 element = if heading {
@@ -2819,6 +4190,7 @@ impl ShortlistApp {
                     .w(px(10.))
                     .h(px(10.)),
             )
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_candidate = Some(id.clone());
                 cx.notify();
@@ -2849,8 +4221,55 @@ impl ShortlistApp {
             }))
     }
 
-    fn streaming_bubble(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The rotating status line: it fades each phrase in and out, while the
+    /// dots keep a small continuous pulse so the turn never looks stuck.
+    fn working_phrase(&self) -> impl IntoElement {
+        let ink = self.palette.ink;
+        let count = WORKING_PHRASES.len() as f32;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(self.palette.accent_soft))
+            .self_start()
+            .child(self.thinking_dots())
+            .child(div().with_animation(
+                "working-phrase",
+                Animation::new(Duration::from_millis(10_000)).repeat(),
+                move |_el, t| {
+                    let position = t * count;
+                    let index = (position as usize).min(WORKING_PHRASES.len() - 1);
+                    let local = position.fract();
+                    let fade = 0.55 + 0.45 * (local * std::f32::consts::PI).sin();
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(ink))
+                        .opacity(fade)
+                        .child(format!("{}…", WORKING_PHRASES[index]))
+                },
+            ))
+    }
+
+    fn streaming_bubble(&self, _cx: &mut Context<Self>) -> AnyElement {
         let text = self.streaming.clone().unwrap_or_default();
+        let progress: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        let muted = self.palette.muted;
+        let progress_block = (!progress.is_empty()).then(|| {
+            div().w_full().flex().flex_col().gap_1().children(
+                progress
+                    .into_iter()
+                    .map(move |line| div().text_xs().text_color(rgb(muted)).child(line)),
+            )
+        });
         div()
             .w_full()
             .flex()
@@ -2866,13 +4285,12 @@ impl ShortlistApp {
                     .flex_col()
                     .items_start()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(self.palette.muted)).child(
-                        if text.trim().is_empty() {
-                            "Shortlist · thinking"
-                        } else {
-                            "Shortlist · writing"
-                        },
-                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(self.palette.muted))
+                            .child("Shortlist · cooking"),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -2884,40 +4302,11 @@ impl ShortlistApp {
                             .border_1()
                             .border_color(rgb(self.palette.border))
                             .text_sm()
-                            .child(if text.trim().is_empty() {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(self.thinking_dots())
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(self.palette.muted))
-                                            .child("Thinking…"),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(self.assistant_body(&text, cx))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(self.palette.accent))
-                                            .child("▍")
-                                            .with_animation(
-                                                "stream-cursor",
-                                                Animation::new(Duration::from_millis(700)).repeat(),
-                                                |el, t| {
-                                                    el.opacity(if t < 0.5 { 1.0 } else { 0.15 })
-                                                },
-                                            ),
-                                    )
-                                    .into_any_element()
-                            }),
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(self.working_phrase())
+                            .children(progress_block),
                     ),
             )
             .into_any_element()
@@ -2998,12 +4387,312 @@ impl ShortlistApp {
                     .h(px(16.))
                     .into_any_element()
             })
+            .hover(|style| style.opacity(if self.busy { 1.0 } else { 0.9 }))
+            .when(self.busy, |el| el.cursor_not_allowed())
+            .when(!self.busy, |el| el.cursor_pointer())
             .on_click(cx.listener(|this, _, window, cx| {
                 let value = this.composer.read(cx).value().to_string();
                 if !value.trim().is_empty() {
                     this.send(value, window, cx);
                 }
             }))
+    }
+
+    fn load_dev(&mut self, cx: &mut Context<Self>) {
+        self.dev_tables = self.store.table_counts().unwrap_or_default();
+        match self.store.inspect_table(&self.dev_table, 60) {
+            Ok(table) => {
+                self.dev_data = Some(table);
+                self.notice = None;
+            }
+            Err(error) => {
+                self.dev_data = None;
+                self.notice = Some(format!("Could not inspect {}: {error}", self.dev_table));
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_dev_table(&mut self, table: String, cx: &mut Context<Self>) {
+        self.dev_table = table;
+        self.load_dev(cx);
+    }
+
+    fn developer_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tables = self.dev_tables.clone();
+        let active = self.dev_table.clone();
+        let data = self.dev_data.clone();
+        let hover = self.palette.hover;
+        let accent_soft = self.palette.accent_soft;
+        let refresh = div()
+            .id("dev-refresh")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(self.palette.accent_soft))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(self.palette.accent))
+            .child(
+                Icon::new(IconName::RefreshCw)
+                    .text_color(rgb(self.palette.accent))
+                    .w(px(14.))
+                    .h(px(14.)),
+            )
+            .child("Refresh")
+            .hover(|style| style.opacity(0.9))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.load_dev(cx)));
+
+        let actions = div().flex().items_center().gap_2().child(refresh);
+
+        let tabs = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_2()
+            .children(tables.iter().map(|(name, count)| {
+                let selected = name == &active;
+                let target = name.clone();
+                div()
+                    .id(SharedString::from(format!("dev-table-{name}")))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if selected {
+                        rgb(self.palette.accent_soft)
+                    } else {
+                        rgb(self.palette.card)
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(self.palette.accent_soft)
+                    } else {
+                        rgb(self.palette.border)
+                    })
+                    .text_xs()
+                    .font_weight(if selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if selected {
+                        rgb(self.palette.accent)
+                    } else {
+                        rgb(self.palette.ink)
+                    })
+                    .child(name.clone())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(self.palette.muted))
+                            .child(count.to_string()),
+                    )
+                    .hover(move |style| {
+                        style.bg(if selected {
+                            rgb(accent_soft)
+                        } else {
+                            rgb(hover)
+                        })
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_dev_table(target.clone(), cx);
+                    }))
+            }));
+
+        let body = match &data {
+            Some(table) => {
+                let schema = table
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "{} {}{}",
+                            column.name,
+                            if column.kind.is_empty() {
+                                "ANY"
+                            } else {
+                                column.kind.as_str()
+                            },
+                            if column.primary { " PK" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let shown = table.rows.len();
+                let total = table.total;
+                let rows = table.rows.iter().enumerate().map(|(index, row)| {
+                    let primary = row
+                        .first()
+                        .map(|value| {
+                            if value.chars().count() > 22 {
+                                format!("{}…", value.chars().take(22).collect::<String>())
+                            } else {
+                                value.clone()
+                            }
+                        })
+                        .unwrap_or_default();
+                    div()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(self.palette.card))
+                        .border_1()
+                        .border_color(rgb(self.palette.border))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("row {} · {primary}", index + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(self.palette.muted))
+                                        .child(format!("{} columns", table.columns.len())),
+                                ),
+                        )
+                        .children(table.columns.iter().zip(row.iter()).map(|(column, value)| {
+                            let muted = value == "NULL";
+                            let embedding = column.name == "embedding";
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap_3()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .w(px(150.))
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .font_family(mono_font())
+                                        .text_color(rgb(self.palette.muted))
+                                        .child(column.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_xs()
+                                        .font_family(mono_font())
+                                        .text_color(if muted {
+                                            rgb(self.palette.muted)
+                                        } else if embedding {
+                                            rgb(self.palette.accent)
+                                        } else {
+                                            rgb(self.palette.ink)
+                                        })
+                                        .child(value.clone()),
+                                )
+                        }))
+                });
+
+                vec![
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(self.palette.muted))
+                                .child(format!(
+                                    "Showing {shown} of {total} rows · newest first · schema"
+                                )),
+                        )
+                        .child(
+                            div()
+                                .p_3()
+                                .rounded_md()
+                                .bg(rgb(self.palette.bg))
+                                .border_1()
+                                .border_color(rgb(self.palette.border))
+                                .text_xs()
+                                .font_family(mono_font())
+                                .text_color(rgb(self.palette.muted))
+                                .child(schema),
+                        )
+                        .into_any_element(),
+                    div()
+                        .text_xs()
+                        .text_color(rgb(self.palette.muted))
+                        .child(
+                            "Embeddings are BLOBs. The preview shows dimensions, L2 norm, and the first eight values. Text is clipped at 600 characters. Register MCP in Settings to expose the same tools to OpenCode natively.",
+                        )
+                        .into_any_element(),
+                ]
+                .into_iter()
+                .chain(rows.map(|row| row.into_any_element()))
+                .collect::<Vec<_>>()
+            }
+            None => vec![
+                div()
+                    .text_sm()
+                    .text_color(rgb(self.palette.muted))
+                    .child(
+                        self.notice
+                            .clone()
+                            .unwrap_or_else(|| "No data loaded.".into()),
+                    )
+                    .into_any_element(),
+            ],
+        };
+
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_10()
+                    .pt_8()
+                    .pb_5()
+                    .border_b_1()
+                    .border_color(rgb(self.palette.border))
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_6()
+                    .child(
+                        self.page_header(
+                            "Developer",
+                            "Read-only view of SQLite: parsed fields, UUIDs, and embedding vectors"
+                                .into(),
+                        ),
+                    )
+                    .child(actions),
+            )
+            .child(div().px_10().py_4().child(tabs))
+            .child(
+                div()
+                    .id("developer-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px_10()
+                    .pb_10()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(body),
+            )
     }
 
     fn settings_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3015,6 +4704,7 @@ impl ShortlistApp {
             .px_8()
             .py_8()
             .flex()
+            .items_start()
             .justify_center()
             .child(
                 div()
@@ -3023,10 +4713,15 @@ impl ShortlistApp {
                     .flex()
                     .flex_col()
                     .gap_5()
-                    .child(self.page_header("Settings", "Connection, index, and local data".into()))
+                    .child(self.page_header(
+                        "Settings",
+                        "Connection, index, updates, and local data".into(),
+                    ))
                     .child(self.connection_card(cx))
+                    .child(self.mcp_card(cx))
                     .child(self.index_card(cx))
                     .child(self.data_card(cx))
+                    .child(self.update_card(cx))
                     .child(self.appearance_card(cx))
                     .child(
                         div()
@@ -3141,9 +4836,69 @@ impl ShortlistApp {
                     ),
             )
             .hover(move |style| style.bg(rgb(hover)))
+            .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_model_dialog(window, cx);
             }))
+    }
+
+    fn mcp_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = self.palette.hover;
+        div()
+            .p_5()
+            .rounded_lg()
+            .bg(rgb(self.palette.card))
+            .border_1()
+            .border_color(rgb(self.palette.border))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.section_header(
+                IconName::Bot,
+                "OpenCode tools",
+                "Native MCP access to the candidate library",
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(self.palette.muted))
+                    .child(
+                        "Register the local MCP server once and OpenCode can call stats, find, screen, get, read, grep, note, and compare directly. OpenCode reloads the config without a restart.",
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-register-mcp")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .self_start()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(self.palette.accent_soft))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(self.palette.accent))
+                    .child(
+                        Icon::new(IconName::Bot)
+                            .text_color(rgb(self.palette.accent))
+                            .w(px(14.))
+                            .h(px(14.)),
+                    )
+                    .child("Register MCP")
+                    .hover(move |style| style.bg(rgb(hover)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.register_mcp(cx))),
+            )
+            .when(self.mcp_status.is_some(), |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(self.palette.muted))
+                        .child(self.mcp_status.clone().unwrap_or_default()),
+                )
+            })
     }
 
     fn index_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3189,6 +4944,7 @@ impl ShortlistApp {
                     )
                     .child("Build / refresh index")
                     .hover(move |style| style.bg(rgb(hover)))
+                    .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| this.build_index(cx))),
             )
     }
@@ -3240,6 +4996,7 @@ impl ShortlistApp {
                             )
                             .child("Load demo candidates")
                             .hover(move |style| style.bg(rgb(hover)))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| this.load_demo(cx))),
                     )
                     .child(
@@ -3266,6 +5023,8 @@ impl ShortlistApp {
                             } else {
                                 "Clear all data"
                             })
+                            .hover(|style| style.opacity(0.8))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if this.confirm_clear {
                                     this.clear_all(cx);
@@ -3335,6 +5094,7 @@ impl ShortlistApp {
                                 "Switch to dark"
                             })
                             .hover(move |style| style.bg(rgb(hover)))
+                            .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
                     ),
             )
@@ -3608,6 +5368,7 @@ impl Render for ModelPicker {
                                                 .h(px(16.)),
                                         )
                                     })
+                                    .cursor_pointer()
                                     .on_click(cx.listener(move |_this, _, window, cx| {
                                         let _ = parent.update(cx, |app, cx| {
                                             app.select_model(model.clone(), cx)
@@ -3673,6 +5434,49 @@ fn merge_extracted(candidate: &mut Candidate, profile: shortlist_ai::ExtractedPr
     if !profile.summary.trim().is_empty() {
         candidate.summary = profile.summary.trim().to_string();
     }
+    let experience: Vec<shortlist_core::Experience> = profile
+        .experience
+        .into_iter()
+        .filter(|role| !role.title.trim().is_empty())
+        .take(10)
+        .map(|mut role| {
+            role.title = role.title.trim().chars().take(120).collect();
+            role.company = role.company.trim().chars().take(120).collect();
+            role.start = role.start.trim().chars().take(40).collect();
+            role.end = role.end.trim().chars().take(40).collect();
+            role.description = role.description.trim().chars().take(420).collect();
+            role.years = role.years.clamp(0.0, 60.0);
+            role
+        })
+        .collect();
+    if !experience.is_empty() {
+        candidate.experience = experience;
+    }
+    let education: Vec<shortlist_core::Education> = profile
+        .education
+        .into_iter()
+        .filter(|item| !item.degree.trim().is_empty() || !item.institution.trim().is_empty())
+        .take(4)
+        .map(|mut item| {
+            item.degree = item.degree.trim().chars().take(160).collect();
+            item.institution = item.institution.trim().chars().take(160).collect();
+            item.year = item.year.trim().chars().take(20).collect();
+            item
+        })
+        .collect();
+    if !education.is_empty() {
+        candidate.education = education;
+    }
+    let certifications: Vec<String> = profile
+        .certifications
+        .into_iter()
+        .map(|item| item.trim().chars().take(120).collect::<String>())
+        .filter(|item| !item.is_empty())
+        .take(10)
+        .collect();
+    if !certifications.is_empty() {
+        candidate.certifications = certifications;
+    }
 }
 
 fn repair_candidate_names(store: &Store) {
@@ -3698,6 +5502,87 @@ fn apply_dark_surfaces(cx: &mut App) {
     });
 }
 
+fn mcp_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    ["shortlist-mcp", "shortlist-mcp.exe"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+        .or_else(|| {
+            let bundled = dir.join("../Resources/shortlist-mcp");
+            bundled.exists().then_some(bundled)
+        })
+}
+
+/// Register the local MCP server with OpenCode once. Best-effort: if the
+/// helper binary is not built, the harness text protocol still works.
+fn ensure_mcp_registered() -> Result<bool, String> {
+    let output = Command::new("opencode")
+        .args(["mcp", "list"])
+        .output()
+        .map_err(|error| format!("opencode mcp list: {error}"))?;
+    let listed = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    if listed.contains("shortlist") {
+        return Ok(false);
+    }
+    let binary = mcp_binary().ok_or_else(|| "shortlist-mcp is not built".to_string())?;
+    let data_dir = shortlist_core::data_dir();
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&data_dir))
+            .unwrap_or(data_dir)
+    };
+    std::fs::create_dir_all(&data_dir).ok();
+    let env = format!("SHORTLIST_DATA_DIR={}", data_dir.display());
+    let output = Command::new("opencode")
+        .args(["mcp", "add", "shortlist", "--global", "--env", &env, "--"])
+        .arg(&binary)
+        .output()
+        .map_err(|error| format!("opencode mcp add: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    let _ = configure_native_mcp();
+    Ok(true)
+}
+
+/// Code Mode is OpenCode's default for MCP. Shortlist exposes eight small tools,
+/// and they work better as direct native tool definitions.
+fn configure_native_mcp() -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let config_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home).join(".config"))
+        .join("opencode");
+    let path = config_dir.join("opencode.json");
+    let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let server = config
+        .get_mut("mcp")
+        .and_then(|mcp| mcp.get_mut("servers"))
+        .and_then(|servers| servers.get_mut("shortlist"))
+        .ok_or_else(|| "shortlist MCP entry not found".to_string())?;
+    server["codemode"] = serde_json::json!(false);
+    std::fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn ui_font() -> SharedString {
     if cfg!(target_os = "macos") {
         "SF Pro Text".into()
@@ -3706,6 +5591,33 @@ fn ui_font() -> SharedString {
     } else {
         "Inter".into()
     }
+}
+
+fn mono_font() -> SharedString {
+    if cfg!(target_os = "macos") {
+        "SF Mono".into()
+    } else if cfg!(target_os = "windows") {
+        "Consolas".into()
+    } else {
+        "monospace".into()
+    }
+}
+
+/// Removes inline Markdown markers before plain-text fragments are rendered.
+fn plain_inline(text: &str) -> String {
+    text.replace("**", "")
+        .replace("~~", "")
+        .replace('`', "")
+        .replace('*', "")
+}
+
+/// True for rank-like cells (`1`, `2`, `—`) whose column should stay narrow.
+fn is_short_value(cell: &str) -> bool {
+    let cell = cell.trim();
+    cell.chars().count() <= 4
+        && cell
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '#' | '-' | '—' | '.' | '%' | '+'))
 }
 
 // Shared candidate-table metrics. Header and rows read the same values, so
@@ -3723,12 +5635,39 @@ const TABLE_GAP: f32 = 12.;
 /// bundled icon subset used by the component library.
 const TRASH_ICON: &[u8] = include_bytes!("../assets/icons/trash.svg");
 
+/// Pause after the last edit before the note is written to SQLite.
+const NOTE_AUTOSAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// The note pane shows one surface at a time, like Obsidian's editing and
+/// reading views, instead of splitting the editor and preview side by side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteMode {
+    Write,
+    Preview,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteSaveStatus {
+    Saved,
+    Saving,
+    Failed,
+}
+
 struct NoteDialog {
     parent: WeakEntity<ShortlistApp>,
     store: Arc<Store>,
     candidate_id: String,
     palette: Palette,
     editor: Entity<EditorState>,
+    mode: NoteMode,
+    /// The last Markdown committed to SQLite, so a debounced save can skip
+    /// no-op writes.
+    saved: String,
+    status: NoteSaveStatus,
+    /// Bumped on every edit; an older debounce sees a stale token and stops.
+    save_generation: u64,
+    /// The note changed since the search index was last rebuilt.
+    index_dirty: bool,
     had_note: bool,
     _subs: Vec<Subscription>,
 }
@@ -3745,6 +5684,7 @@ impl NoteDialog {
     ) -> Self {
         let text = body.map(note_text_from_stored).unwrap_or_default();
         let had_note = !text.trim().is_empty();
+        let saved = text.clone();
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .line_number(false)
@@ -3753,12 +5693,15 @@ impl NoteDialog {
                 .soft_wrap(true)
                 .default_value(text)
         });
+        cx.defer_in(window, |this, window, cx| {
+            this.editor.update(cx, |state, cx| state.focus(window, cx));
+        });
         let sub = cx.subscribe_in(
             &editor,
             window,
-            |_this, _editor, event: &InputEvent, _window, cx| {
+            |this, _editor, event: &InputEvent, _window, cx| {
                 if matches!(event, InputEvent::Change) {
-                    cx.notify();
+                    this.schedule_autosave(cx);
                 }
             },
         );
@@ -3769,6 +5712,11 @@ impl NoteDialog {
             candidate_id,
             palette,
             editor,
+            mode: NoteMode::Write,
+            saved,
+            status: NoteSaveStatus::Saved,
+            save_generation: 0,
+            index_dirty: false,
             had_note,
             _subs: vec![sub],
         }
@@ -3785,7 +5733,9 @@ impl NoteDialog {
             state.set_selected_range(selection, cx);
             state.focus(window, cx);
         });
-        cx.notify();
+        // `set_value` intentionally suppresses input events, so formatting
+        // buttons must ask for an autosave themselves.
+        self.schedule_autosave(cx);
     }
 
     fn set_block(&mut self, kind: BlockKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -3806,35 +5756,134 @@ impl NoteDialog {
         self.apply_edit(edit, window, cx);
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: NoteMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        match mode {
+            NoteMode::Write => {
+                self.editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            NoteMode::Preview => {
+                // Commit before reading, then drop focus so keystrokes cannot
+                // change the hidden source buffer.
+                self.save_now(cx);
+                window.blur(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Saves after a short pause so typing stays smooth and the note is never
+    /// left waiting for a Save button.
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        let current = self.markdown(cx);
+        if current == self.saved {
+            if self.status != NoteSaveStatus::Saved {
+                self.status = NoteSaveStatus::Saved;
+                cx.notify();
+            }
+            return;
+        }
+
+        self.status = NoteSaveStatus::Saving;
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTE_AUTOSAVE_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.save_generation == generation {
+                    this.save_now(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Writes the current Markdown immediately. Returns `false` when SQLite
+    /// rejected the write, so closing can keep the dialog open.
+    fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_generation = self.save_generation.wrapping_add(1);
         let markdown = self.markdown(cx);
+        if markdown == self.saved {
+            self.status = NoteSaveStatus::Saved;
+            cx.notify();
+            return true;
+        }
+
         let empty = markdown.trim().is_empty();
         let result = if empty {
             self.store.delete_note(&self.candidate_id)
         } else {
             self.store.save_note(&self.candidate_id, &markdown)
         };
-        self.report(result.is_ok(), empty, cx);
+
+        match result {
+            Ok(()) => {
+                self.had_note = !empty;
+                self.saved = markdown;
+                self.status = NoteSaveStatus::Saved;
+                self.index_dirty = true;
+                cx.notify();
+                true
+            }
+            Err(_) => {
+                // Keep `saved` untouched so the next edit or close retries.
+                self.status = NoteSaveStatus::Failed;
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.save_now(cx) {
+            return;
+        }
+        self.reindex_if_dirty(cx);
         window.close_dialog(cx);
     }
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let result = self.store.delete_note(&self.candidate_id);
-        self.report(result.is_ok(), true, cx);
-        window.close_dialog(cx);
+        // A pending autosave must not resurrect the note after this delete.
+        self.save_generation = self.save_generation.wrapping_add(1);
+        match self.store.delete_note(&self.candidate_id) {
+            Ok(()) => {
+                self.saved.clear();
+                self.had_note = false;
+                self.index_dirty = false;
+                self.schedule_reindex(cx);
+                self.notify_parent("Note removed.", cx);
+                window.close_dialog(cx);
+            }
+            Err(_) => {
+                self.status = NoteSaveStatus::Failed;
+                cx.notify();
+            }
+        }
     }
 
-    fn report(&self, ok: bool, removed: bool, cx: &mut Context<Self>) {
+    fn reindex_if_dirty(&mut self, cx: &mut Context<Self>) {
+        if self.index_dirty {
+            self.index_dirty = false;
+            self.schedule_reindex(cx);
+        }
+    }
+
+    fn schedule_reindex(&self, cx: &mut Context<Self>) {
         if let Some(parent) = self.parent.upgrade() {
-            let message = if ok {
-                if removed {
-                    "Note removed."
-                } else {
-                    "Note saved."
-                }
-            } else {
-                "Could not save the note."
-            };
+            let candidate_id = self.candidate_id.clone();
+            parent.update(cx, |app, cx| {
+                app.reindex_candidate(candidate_id, cx);
+            });
+        }
+    }
+
+    fn notify_parent(&self, message: &'static str, cx: &mut Context<Self>) {
+        if let Some(parent) = self.parent.upgrade() {
             parent.update(cx, |app, cx| {
                 app.notice = Some(message.into());
                 cx.notify();
@@ -3854,6 +5903,7 @@ impl Render for NoteDialog {
         let strike = markdown_tools::is_wrapped(&markdown, selection.clone(), "~~");
         let code = markdown_tools::is_wrapped(&markdown, selection.clone(), "`");
         let words = markdown.split_whitespace().count();
+        let write_mode = self.mode == NoteMode::Write;
 
         let mut heading_buttons = Vec::with_capacity(6);
         const HEADING_LABELS: [&str; 6] = ["H1", "H2", "H3", "H4", "H5", "H6"];
@@ -3897,7 +5947,7 @@ impl Render for NoteDialog {
         );
         let quote = note_button(
             SharedString::from("note-quote"),
-            div().child("❝").into_any_element(),
+            div().child("“").into_any_element(),
             matches!(block, BlockKind::Quote),
             palette,
             cx,
@@ -3948,107 +5998,114 @@ impl Render for NoteDialog {
                 .into_any_element()
         };
 
+        let toolbar = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .children(heading_buttons)
+            .child(paragraph)
+            .child(divider())
+            .child(bold_button)
+            .child(italic_button)
+            .child(strike_button)
+            .child(code_button)
+            .child(divider())
+            .child(bullet)
+            .child(numbered)
+            .child(quote);
+
+        let body = if write_mode {
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .px_3()
+                .py_2()
+                .child(
+                    Editor::new(&self.editor)
+                        .appearance(false)
+                        .bordered(false)
+                        .font_family(ui_font())
+                        .text_size(px(13.))
+                        .w_full()
+                        .h_full(),
+                )
+                .into_any_element()
+        } else if markdown.trim().is_empty() {
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .p_6()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::FileText)
+                                .text_color(rgb(palette.muted))
+                                .w(px(22.))
+                                .h(px(22.)),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(palette.muted))
+                                .child("Nothing to read yet"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette.muted))
+                                .child("Switch to Write and start typing."),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
+                .p_6()
+                .child(
+                    TextView::markdown("note-preview", markdown.clone())
+                        .selectable(true)
+                        .scrollable(true),
+                )
+                .into_any_element()
+        };
+
+        let (status_label, status_color) = match self.status {
+            NoteSaveStatus::Saved => ("Saved", palette.success),
+            NoteSaveStatus::Saving => ("Saving…", palette.muted),
+            NoteSaveStatus::Failed => ("Couldn't save", palette.danger),
+        };
+
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .children(heading_buttons)
-                    .child(paragraph)
-                    .child(divider())
-                    .child(bold_button)
-                    .child(italic_button)
-                    .child(strike_button)
-                    .child(code_button)
-                    .child(divider())
-                    .child(bullet)
-                    .child(numbered)
-                    .child(quote),
-            )
+            .when(write_mode, |el| el.child(toolbar))
             .child(
                 div()
                     .w_full()
                     .h(px(470.))
                     .flex()
+                    .flex_col()
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(palette.border))
-                    .bg(rgb(palette.card))
+                    .bg(rgb(palette.bg))
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .bg(rgb(palette.bg))
-                            .child(self.pane_header("MARKDOWN", "Write", palette))
-                            .child(
-                                div().flex_1().min_h(px(0.)).px_3().py_2().child(
-                                    Editor::new(&self.editor)
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .font_family(ui_font())
-                                        .text_size(px(13.))
-                                        .w_full()
-                                        .h_full(),
-                                ),
-                            ),
-                    )
-                    .child(div().w(px(1.)).h_full().bg(rgb(palette.border)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .bg(rgb(palette.card))
-                            .child(self.pane_header("PREVIEW", "Rendered", palette))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h(px(0.))
-                                    .p_4()
-                                    .when(markdown.trim().is_empty(), |el| {
-                                        el.flex().items_center().justify_center().child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .items_center()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(rgb(palette.muted))
-                                                        .child("Your preview appears here"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(palette.muted))
-                                                        .child(
-                                                            "Markdown: # heading, **bold**, - list",
-                                                        ),
-                                                ),
-                                        )
-                                    })
-                                    .when(!markdown.trim().is_empty(), |el| {
-                                        el.child(
-                                            TextView::markdown("note-preview", markdown.clone())
-                                                .selectable(true)
-                                                .scrollable(true),
-                                        )
-                                    }),
-                            ),
-                    ),
+                    .child(self.pane_header(palette, self.mode_switch(palette, cx)))
+                    .child(body),
             )
             .child(
                 div()
@@ -4058,11 +6115,36 @@ impl Render for NoteDialog {
                     .gap_3()
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(palette.muted))
-                            .child(format!(
-                                "{words} words · Markdown · stored only on this device"
-                            )),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(rgb(status_color)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(status_color))
+                                    .child(status_label),
+                            )
+                            .child(div().text_xs().text_color(rgb(palette.muted)).child("·"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .child(format!("{words} words")),
+                            )
+                            .child(div().text_xs().text_color(rgb(palette.muted)).child("·"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .child("Only on this device"),
+                            ),
                     )
                     .child(
                         div()
@@ -4079,6 +6161,8 @@ impl Render for NoteDialog {
                                         .text_xs()
                                         .text_color(rgb(palette.danger))
                                         .child("Delete note")
+                                        .hover(|style| style.opacity(0.75))
+                                        .cursor_pointer()
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.delete(window, cx);
                                         })),
@@ -4086,22 +6170,7 @@ impl Render for NoteDialog {
                             })
                             .child(
                                 div()
-                                    .id("note-cancel")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(palette.border))
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted))
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|_, _, window, cx| {
-                                        window.close_dialog(cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("note-save")
+                                    .id("note-done")
                                     .px_3()
                                     .py_2()
                                     .rounded_md()
@@ -4109,9 +6178,11 @@ impl Render for NoteDialog {
                                     .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(palette.on_accent))
-                                    .child("Save note")
+                                    .child("Done")
+                                    .hover(|style| style.opacity(0.9))
+                                    .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save(window, cx);
+                                        this.close(window, cx);
                                     })),
                             ),
                     ),
@@ -4120,7 +6191,44 @@ impl Render for NoteDialog {
 }
 
 impl NoteDialog {
-    fn pane_header(&self, title: &'static str, hint: &'static str, palette: Palette) -> AnyElement {
+    /// Obsidian-style segmented control for the single note surface.
+    fn mode_switch(&self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.mode;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .bg(rgb(palette.sidebar))
+            .child(note_mode_tab(
+                "note-mode-write",
+                "Write",
+                IconName::FileText,
+                active == NoteMode::Write,
+                NoteMode::Write,
+                palette,
+                cx,
+            ))
+            .child(note_mode_tab(
+                "note-mode-preview",
+                "Preview",
+                IconName::Eye,
+                active == NoteMode::Preview,
+                NoteMode::Preview,
+                palette,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn pane_header(&self, palette: Palette, mode_switch: AnyElement) -> AnyElement {
+        let surface = match self.mode {
+            NoteMode::Write => "Markdown",
+            NoteMode::Preview => "Rendered",
+        };
         div()
             .px_3()
             .py_2()
@@ -4129,16 +6237,78 @@ impl NoteDialog {
             .justify_between()
             .border_b_1()
             .border_color(rgb(palette.border))
+            .bg(rgb(palette.card))
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(palette.muted))
-                    .child(title),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.muted))
+                            .child("NOTE"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.muted))
+                            .child(surface),
+                    ),
             )
-            .child(div().text_xs().text_color(rgb(palette.muted)).child(hint))
+            .child(mode_switch)
             .into_any_element()
     }
+}
+
+fn note_mode_tab(
+    id: &'static str,
+    label: &'static str,
+    icon: IconName,
+    active: bool,
+    mode: NoteMode,
+    palette: Palette,
+    cx: &mut Context<NoteDialog>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .h(px(24.))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_md()
+        .bg(rgb(if active {
+            palette.card
+        } else {
+            palette.sidebar
+        }))
+        .border_1()
+        .border_color(rgb(if active {
+            palette.border
+        } else {
+            palette.sidebar
+        }))
+        .text_xs()
+        .text_color(rgb(if active { palette.ink } else { palette.muted }))
+        .hover(move |style| style.bg(rgb(if active { palette.card } else { palette.hover })))
+        .cursor_pointer()
+        .child(
+            Icon::new(icon)
+                .w(px(12.))
+                .h(px(12.))
+                .text_color(rgb(if active {
+                    palette.accent
+                } else {
+                    palette.muted
+                })),
+        )
+        .child(div().child(label))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.set_mode(mode, window, cx);
+        }))
+        .into_any_element()
 }
 
 fn note_button(
@@ -4175,7 +6345,15 @@ fn note_button(
         } else {
             rgb(palette.ink)
         })
+        .hover(move |style| {
+            style.bg(if active {
+                rgb(palette.accent_soft)
+            } else {
+                rgb(palette.hover)
+            })
+        })
         .child(label)
+        .cursor_pointer()
         .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
         .into_any_element()
 }

@@ -9,4 +9,5 @@ shortlist-core = { path = "../core" }
 shortlist-store = { path = "../store" }
 shortlist-embed = { path = "../embed" }
 shortlist-ai = { path = "../ai" }
+shortlist-harness = { path = "../harness" }
 anyhow.workspace = true

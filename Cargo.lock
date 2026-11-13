@@ -6621,6 +6621,7 @@ dependencies = [
  "shortlist-parse",
  "shortlist-pipeline",
  "shortlist-store",
+ "shortlist-update",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6630,9 +6631,11 @@ name = "shortlist-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "shortlist-ai",
  "shortlist-core",
  "shortlist-embed",
+ "shortlist-harness",
  "shortlist-parse",
  "shortlist-pipeline",
  "shortlist-store",
@@ -6659,6 +6662,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "shortlist-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "shortlist-ai",
+ "shortlist-core",
+ "shortlist-embed",
+ "shortlist-store",
+]
+
+[[package]]
+name = "shortlist-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "shortlist-core",
+ "shortlist-embed",
+ "shortlist-harness",
+ "shortlist-store",
+]
+
+[[package]]
 name = "shortlist-parse"
 version = "0.1.0"
 dependencies = [
@@ -6679,6 +6705,7 @@ dependencies = [
  "shortlist-ai",
  "shortlist-core",
  "shortlist-embed",
+ "shortlist-harness",
  "shortlist-store",
 ]
 
@@ -6693,6 +6720,20 @@ dependencies = [
  "sha2 0.10.9",
  "shortlist-core",
  "uuid",
+]
+
+[[package]]
+name = "shortlist-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]

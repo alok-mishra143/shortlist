@@ -351,6 +351,319 @@ pub fn parse_resume(path: &Path) -> Result<Candidate> {
     Ok(profile_from_text(path, text))
 }
 
+const EXPERIENCE_HEADERS: &[&str] = &[
+    "experience",
+    "work experience",
+    "professional experience",
+    "employment",
+    "employment history",
+    "work history",
+    "career history",
+];
+
+const SECTION_STOPS: &[&str] = &[
+    "education",
+    "skills",
+    "technical skills",
+    "projects",
+    "certifications",
+    "awards",
+    "publications",
+    "languages",
+    "volunteer",
+    "interests",
+    "summary",
+    "profile",
+    "references",
+];
+
+/// The text between a section heading and the next section heading.
+fn section_body(text: &str, headers: &[&str]) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|line| {
+        let clean = line.trim().trim_end_matches(':').to_lowercase();
+        headers.contains(&clean.as_str())
+    })?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| {
+            let clean = line.trim().trim_end_matches(':').to_lowercase();
+            SECTION_STOPS.contains(&clean.as_str())
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    let body = lines[start + 1..end].join("\n");
+    (!body.trim().is_empty()).then_some(body)
+}
+
+fn parse_month_year(value: &str) -> Option<(String, i32, usize)> {
+    let re = Regex::new(
+        r"(?i)((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s*)?((?:19|20)\d{2})",
+    )
+    .ok()?;
+    let caps = re.captures(value)?;
+    let label = caps.get(0)?.as_str().trim().to_string();
+    let year = caps.get(2)?.as_str().parse::<i32>().ok()?;
+    let end = caps.get(0)?.end();
+    Some((label, year, end))
+}
+
+fn date_range(line: &str) -> Option<(String, String, f32)> {
+    let lower = line.to_lowercase();
+    let looks_like_range = lower.contains("present")
+        || lower.contains("current")
+        || lower.contains("now")
+        || lower.contains("–")
+        || lower.contains("—")
+        || lower.contains(" to ")
+        || (lower.contains('-') && lower.matches(|c: char| c.is_ascii_digit()).count() >= 4);
+    if !looks_like_range {
+        return None;
+    }
+    let first = parse_month_year(line)?;
+    let rest = &line[first.2.min(line.len())..];
+    let end = if lower.contains("present") || lower.contains("current") || lower.contains("now") {
+        "Present".to_string()
+    } else {
+        parse_month_year(rest)
+            .map(|(label, _, _)| label)
+            .unwrap_or_default()
+    };
+    if end.is_empty() && !lower.contains("present") {
+        return None;
+    }
+    let end_year = if end == "Present" {
+        current_year()
+    } else {
+        parse_month_year(&end)
+            .map(|(_, year, _)| year)
+            .unwrap_or(first.1)
+    };
+    let years = (end_year - first.1).max(0) as f32;
+    Some((first.0, end, years))
+}
+
+fn current_year() -> i32 {
+    1970 + (now_ms() / 31_556_952_000) as i32
+}
+
+fn role_word(value: &str) -> bool {
+    let value = value.to_lowercase();
+    [
+        "engineer",
+        "developer",
+        "designer",
+        "manager",
+        "scientist",
+        "analyst",
+        "architect",
+        "consultant",
+        "director",
+        "lead",
+        "specialist",
+        "recruiter",
+        "product",
+        "data",
+        "security",
+        "devops",
+        "platform",
+        "intern",
+        "founder",
+        "president",
+        "officer",
+    ]
+    .iter()
+    .any(|word| value.contains(word))
+}
+
+fn title_and_company(previous: &[&str]) -> (String, String) {
+    let mut lines = previous
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with(['•', '-', '*', '·']));
+    let Some(first) = lines.next() else {
+        return (String::new(), String::new());
+    };
+    for separator in [" at ", " | ", " · ", " – ", " — ", ", "] {
+        if let Some((left, right)) = first.split_once(separator) {
+            let (left, right) = (left.trim(), right.trim());
+            if !left.is_empty() && !right.is_empty() {
+                return if role_word(right) && !role_word(left) {
+                    (right.to_string(), left.to_string())
+                } else {
+                    (left.to_string(), right.to_string())
+                };
+            }
+        }
+    }
+    let company = lines
+        .next()
+        .filter(|line| line.len() < 90)
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default();
+    (first.trim().to_string(), company)
+}
+
+fn extract_experience(text: &str) -> Vec<shortlist_core::Experience> {
+    let Some(section) = section_body(text, EXPERIENCE_HEADERS) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = section.lines().collect();
+    let mut roles = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some((start, end, years)) = date_range(line) else {
+            continue;
+        };
+        let (title, company) = title_and_company(&lines[..index]);
+        if title.is_empty() {
+            continue;
+        }
+        let mut description = String::new();
+        for (next_index, next) in lines.iter().enumerate().skip(index + 1) {
+            if date_range(next).is_some() {
+                break;
+            }
+            // A short title/company line immediately before the next date
+            // belongs to the next role, not to this description.
+            let trimmed = next.trim();
+            let bullet = trimmed.starts_with(['•', '-', '*', '·']);
+            let next_role_header = !bullet
+                && !trimmed.ends_with('.')
+                && trimmed.split_whitespace().count() <= 12
+                && lines
+                    .iter()
+                    .skip(next_index + 1)
+                    .take(2)
+                    .any(|line| date_range(line).is_some());
+            if next_role_header {
+                break;
+            }
+            let next = trimmed;
+            if next.is_empty() {
+                continue;
+            }
+            if !description.is_empty() {
+                description.push(' ');
+            }
+            description.push_str(next.trim_start_matches(['•', '-', '*', '·']).trim());
+            if description.chars().count() > 420 {
+                break;
+            }
+        }
+        if description.chars().count() > 420 {
+            description = description.chars().take(420).collect::<String>();
+            description.push('…');
+        }
+        if roles.iter().any(|role: &shortlist_core::Experience| {
+            role.title.eq_ignore_ascii_case(&title) && role.start.eq_ignore_ascii_case(&start)
+        }) {
+            continue;
+        }
+        roles.push(shortlist_core::Experience {
+            title,
+            company,
+            start,
+            end,
+            years,
+            description,
+        });
+        if roles.len() >= 10 {
+            break;
+        }
+    }
+    roles
+}
+
+fn extract_education(text: &str) -> Vec<shortlist_core::Education> {
+    let scope = section_body(text, &["education", "academic background"])
+        .unwrap_or_else(|| text.to_string());
+    let degree_re = Regex::new(
+        r"(?i)(b\.?tech|b\.?e\.?\b|b\.?s\.?\b|b\.?a\.?\b|m\.?tech|m\.?s\.?\b|m\.?a\.?\b|mba|ph\.?d|bachelor|master|doctorate|diploma|degree)",
+    )
+    .unwrap_or_else(|_| Regex::new("$^").expect("empty regex"));
+    let institution_re = Regex::new(r"(?i)(university|college|institute|school|academy)").unwrap();
+    let year_re = Regex::new(r"\b(19|20)\d{2}\b").unwrap();
+    let lines: Vec<&str> = scope
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut education = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !degree_re.is_match(line) {
+            continue;
+        }
+        let institution = lines[index + 1..]
+            .iter()
+            .take(2)
+            .find(|candidate| institution_re.is_match(candidate))
+            .map(|candidate| candidate.to_string())
+            .unwrap_or_default();
+        let year = year_re
+            .find(line)
+            .or_else(|| {
+                lines[index + 1..]
+                    .iter()
+                    .take(2)
+                    .find_map(|candidate| year_re.find(candidate))
+            })
+            .map(|found| found.as_str().to_string())
+            .unwrap_or_default();
+        education.push(shortlist_core::Education {
+            degree: line.trim_start_matches(['•', '-', '*', '·']).to_string(),
+            institution,
+            year,
+        });
+        if education.len() >= 4 {
+            break;
+        }
+    }
+    education
+}
+
+fn extract_certifications(text: &str) -> Vec<String> {
+    let Some(section) = section_body(
+        text,
+        &["certifications", "certificates", "licenses", "courses"],
+    ) else {
+        return Vec::new();
+    };
+    section
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['•', '-', '*', '·']).trim())
+        .filter(|line| line.len() >= 3 && line.len() <= 120)
+        .take(10)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Total calendar span covered by the roles, for filling in missing totals.
+fn experience_span(experience: &[shortlist_core::Experience]) -> f32 {
+    let mut earliest: Option<i32> = None;
+    let mut latest: Option<i32> = None;
+    for role in experience {
+        if let Some((_, year, _)) = parse_month_year(&role.start) {
+            earliest = Some(earliest.map_or(year, |value| value.min(year)));
+        }
+        let end_year = if role.is_current() {
+            Some(current_year())
+        } else {
+            parse_month_year(&role.end).map(|(_, year, _)| year)
+        };
+        if let Some(year) = end_year {
+            latest = Some(latest.map_or(year, |value| value.max(year)));
+        }
+    }
+    match (earliest, latest) {
+        (Some(start), Some(end)) => (end - start).max(0) as f32,
+        _ => 0.0,
+    }
+}
+
 pub fn profile_from_text(path: &Path, text: String) -> Candidate {
     let file_name = path
         .file_name()
@@ -429,16 +742,12 @@ pub fn profile_from_text(path: &Path, text: String) -> Candidate {
         .filter_map(|c| c.get(1)?.as_str().parse::<f32>().ok())
         .fold(0.0f32, f32::max);
 
-    let mut summary = text
-        .lines()
-        .skip_while(|l| *l == name)
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if summary.chars().count() > 340 {
-        summary = summary.chars().take(340).collect::<String>();
-        summary.push('…');
-    }
+    // Structured career data. The AI pass refines this; the heuristics mean an
+    // import is still rankable when AI is unavailable.
+    let experience = extract_experience(&text);
+    let years = years.max(experience_span(&experience));
+    let education = extract_education(&text);
+    let certifications = extract_certifications(&text);
 
     let location = lines
         .iter()
@@ -451,6 +760,41 @@ pub fn profile_from_text(path: &Path, text: String) -> Candidate {
         .map(|l| l.to_string())
         .unwrap_or_default();
 
+    let summary = section_body(&text, &["summary", "profile", "about"])
+        .map(|body| {
+            body.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| value.chars().count() >= 40)
+        .unwrap_or_else(|| {
+            lines
+                .iter()
+                .skip_while(|line| **line == name)
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    **line != headline
+                        && **line != location
+                        && !line.contains('@')
+                        && !lower.contains("years of experience")
+                        && !lower.contains("phone")
+                        && !SECTION_STOPS.contains(&lower.as_str())
+                        && (line.split_whitespace().count() >= 6 || line.ends_with('.'))
+                })
+                .take(3)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let mut summary = summary;
+    if summary.chars().count() > 340 {
+        summary = summary.chars().take(340).collect::<String>();
+        summary.push('…');
+    }
+
     Candidate {
         id: Uuid::new_v4().to_string(),
         name: name.trim().to_string(),
@@ -461,6 +805,9 @@ pub fn profile_from_text(path: &Path, text: String) -> Candidate {
         years,
         skills,
         summary,
+        experience,
+        education,
+        certifications,
         text,
         file_name,
         created_at: now_ms(),
@@ -485,5 +832,41 @@ mod tests {
     fn finds_a_name_above_sections() {
         let text = "TECHNICAL SKILLS\n\nAlok Mishra\n\nExperience\n";
         assert_eq!(derive_name("resume.pdf", text), "Alok Mishra");
+    }
+
+    #[test]
+    fn extracts_roles_education_and_certifications() {
+        let text = "\
+Jane Doe
+Senior Backend Engineer
+London, UK
+
+Experience
+Stripe | Senior Backend Engineer
+Mar 2021 – Present
+Built payment systems and led the ledger service.
+
+Acme | Software Engineer
+2018 – 2021
+Shipped internal tooling.
+
+Education
+B.Tech Computer Science
+University of London
+2014
+
+Certifications
+AWS Solutions Architect
+Certified Kubernetes Administrator
+";
+        let candidate = profile_from_text(std::path::Path::new("jane_doe.pdf"), text.into());
+        assert_eq!(candidate.experience.len(), 2, "{:?}", candidate.experience);
+        assert_eq!(candidate.experience[0].title, "Senior Backend Engineer");
+        assert_eq!(candidate.experience[0].company, "Stripe");
+        assert!(candidate.experience[0].is_current());
+        assert!(candidate.years >= 5.0, "{}", candidate.years);
+        assert_eq!(candidate.education.len(), 1);
+        assert_eq!(candidate.certifications.len(), 2);
+        assert!(candidate.index_text().contains("Stripe"));
     }
 }

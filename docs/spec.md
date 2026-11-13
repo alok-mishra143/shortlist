@@ -38,20 +38,21 @@ Shortlist takes the opposite position. The library, the embeddings, the scores, 
 4. **Job (next)** — paste or write a JD. The AI turns it into criteria you can see, edit, and weight.
 5. **Top 10 (next)** — exactly ten candidates, ordered, each with a score band, matched evidence, gaps, and a two-line rationale.
 6. **Report (next)** — export the ten as CSV or a clean PDF for the client.
-7. **Settings (live)** — four compact cards for OpenCode, semantic index, local data, and appearance; model selection opens in a searchable dialog.
+7. **Settings (live)** — five compact cards for OpenCode, semantic index, local data, updates, and appearance; model selection opens in a searchable dialog.
+8. **Developer (live)** — a read-only SQLite inspector: table counts, column types, UUIDs, parsed JSON fields, and embedding previews (dimensions, L2 norm, first values).
 
 Everything is one window, one accent colour, generous whitespace, keyboard-first. No dashboards, no charts that don't answer a question.
 
 ### Interaction details
 
-- **Candidate drawer** — click any row and the candidate slides in from the right with contact details, skills, summary, and the extracted resume. Selecting another candidate updates the drawer in place: the panel keeps its width, the profile fades in, and the scroll resets.
+- **Candidate drawer** — click any row and the candidate slides in from the right with contact details, skills, summary, roles, education, certifications, and the extracted resume. Selecting another candidate updates the drawer in place: the panel keeps its width, the profile fades in, and the scroll resets.
 - **Collapsible sidebar** — 220 ms width animation between 224 px and a 76 px icon rail. The choice is remembered.
 - **Dark mode** — true-black background, near-black cards, matching GPUI Kit surfaces; toggle at the bottom of the sidebar.
-- **Streaming chat** — assistant tokens arrive over SSE and render as markdown in a live bubble with a blinking cursor.
+- **Chat progress** — local tool calls appear in the live bubble; judgement answers render when the bounded tool loop finishes.
 - **Chat rhythm** — avatar bubbles, a 24 px message gap, a three-dot thinking animation, and a floating composer with a circular send button.
 - **Inline candidate chips** — a compact neutral pill with a soft initial avatar and a chevron; no citation strip at the bottom.
 - **Candidates table** — avatars, skill chips, hover rows, a chevron into the drawer, and a confirmation before deleting a candidate and its indexed chunks. Every column except Skills is fixed; Skills absorbs the remaining width and Actions stays pinned right.
-- **Rich-text notes** — bold, italic, underline, strikethrough, seven text colours, five highlighter colours, and clear formatting. Stored per candidate as versioned JSON in SQLite, using the editor engine already shipped with GPUI Kit.
+- **Markdown notes** — the Note action in the drawer opens a single-pane Markdown editor with **Write** and **Preview** views, so the source and its rendered output share one surface instead of sitting side by side: H1–H6, paragraphs, **bold**, *italic*, ~~strikethrough~~, `inline code`, bullet and numbered lists, and block quotes. Paste Markdown and it renders as written. Edits save automatically after a short typing pause — there is no Save button — and closing the dialog commits any last keystroke. Notes are stored per candidate as plain Markdown in SQLite, and their text joins the candidate's search index and tool results so the assistant can answer from them.
 - **Import progress** — a banner with the current file, the active stage (extracting, reading with AI, embedding, saved), a segmented progress bar, and a Stop button that halts at the next safe point.
 
 ## 4. Architecture
@@ -156,7 +157,7 @@ PDF/DOCX → text (local) → AI profile call → validate + merge → chunk + e
                                           AI fails? → deterministic fallback
 ```
 
-Text extraction is local and deterministic. The selected model then receives the resume text and returns one strict JSON profile: name, headline, location, total experience, skills, summary, email, and phone. The result is validated before saving — a section heading can never become a name, and missing fields fall back to the rule-based profile. A bad name can be repaired from the drawer with **Re-read with AI**.
+Text extraction is local and deterministic. The selected model then receives the resume text and returns one strict JSON profile: name, headline, location, total experience, skills, summary, email, phone, roles (title, company, dates, per-role years, description), education, and certifications. The result is validated before saving — a section heading can never become a name, and missing fields fall back to the rule-based profile. A bad name, a missing role, or an incomplete profile can be repaired from the drawer with **Re-read with AI**, which re-chunks the profile and rebuilds its embeddings.
 
 This is one call per resume, not per query. The model is involved only where it earns its keep:
 
@@ -167,6 +168,8 @@ This is one call per resume, not per query. The model is involved only where it 
 
 The only local model is the embedding encoder, which runs after extraction, on the machine, with no network. It is the one thing we bundle because it buys semantic recall that rules cannot.
 
+The only other outbound request is the optional update check: Shortlist asks GitHub for the newest published release and, only after the user accepts, downloads and verifies the build. No candidate data, prompts, or library contents are included. Automatic checks can be turned off in Settings; the build and database keep working offline.
+
 ### 6.3 Ranking: two stages
 
 **Stage 1 — hybrid, over all 2,000+.** Under a second. Two independent retrievers run against every candidate:
@@ -174,9 +177,9 @@ The only local model is the embedding encoder, which runs after extraction, on t
 - **Lexical:** field-weighted BM25 over the full resume text, must-have and nice-to-have term matching, and a skill-synonym map ("Rust" ↔ "systems programming", "JS" ↔ "JavaScript").
 - **Semantic:** cosine similarity between the JD and each resume section, using local `e5-small-v2` embeddings.
 
-Reciprocal rank fusion merges the two lists, and the structural scorers (years curve, seniority, recency, domain) adjust the result. Output: a 0–100 pre-score and the **top 30**. Nobody sees this list; it exists to hand the model a good pool.
+Reciprocal rank fusion merges the two lists, and the structural scorers (years curve, seniority, recency, role-description relevance, location) adjust the result. Output: a 0–100 pre-score and the **top 30**. Nobody sees this list; it exists to hand the model a good pool.
 
-**How the embeddings are built.** After text extraction, each resume is split into section-aware chunks (summary, each role, skills, education), roughly 300 tokens with 50-token overlap. E5 expects its prefixes — `passage: ` for resumes, `query: ` for the JD — and skipping them costs accuracy. The result is 384-dimensional vectors stored in SQLite next to their chunks.
+**How the embeddings are built.** After text extraction and profile repair, the index text is assembled from the headline, location, skills, summary, structured roles, education, certifications, and resume body. It is split into section-aware chunks, roughly 300 tokens with 50-token overlap, so a re-read changes the vectors even when the uploaded file does not. Recruiter notes join the index and are re-embedded when saved. E5 expects its prefixes — `passage: ` for resumes, `query: ` for the JD — and skipping them costs accuracy. The result is 384-dimensional vectors stored in SQLite next to their chunks.
 
 **No ANN index.** 2,000 resumes × ~10 chunks is about 20,000 vectors, roughly 30 MB as f32. Brute-force cosine takes a few milliseconds. An HNSW index would add a dependency and a build step for no user-visible gain.
 
@@ -199,19 +202,21 @@ Reciprocal rank fusion merges the two lists, and the structural scorers (years c
 - A local audit log records provider, model, prompt version, input hash, and output for every judgment.
 - No rejection emails, no auto-actions. Human decision only.
 
-### 6.5 Chat grounded in the library
+### 6.5 Chat: tools local, model answers
 
-The chat is not a generic assistant. Every question goes through the same hybrid retriever the ranker uses:
+The chat is not a generic assistant, and it is not a prompt stuffed with resume excerpts. Each question uses the cheapest local evidence, but the model always writes the answer:
 
-1. The question is embedded with the `query: ` prefix and scored against the local vectors.
-2. BM25 scores the same library.
-3. Reciprocal-rank fusion picks the four best candidates.
-4. Their excerpts go into the prompt, with instructions to cite names and admit missing evidence.
-5. The answer is stored in local history and shown in the thread.
+1. **Local intent routing.** A named candidate becomes `get` (plus `read` when the question asks for detail); two named candidates become `compare`; an aggregate question becomes `stats`; everything else becomes `shortlist` over the hybrid retriever.
+2. **Tools, not excerpts.** The tools run against SQLite, FTS5 and the local vectors. They return compact pipe-separated rows with short handles (`a1`), a score, matched requirements, and a clipped evidence line — never a resume body. A `read` or `grep` call returns only matching windows.
+3. **Every answer reaches the model.** Counts, profile lookups, and explicit lists are prefetched locally and passed to the model as evidence; the model writes the final answer. Evaluative questions — best, top, strongest, compare, recommend, should I hire, why, summarise — also always reach the model, and a local pre-score is never presented as the verdict. Local direct rendering is opt-in (`Config::direct`) for offline tooling and benchmarks; chat leaves it off.
+4. **A bounded model loop with a research pack.** On an evaluative question the model sees the native MCP tool schemas (when registered), a one-line library digest, the shortlist, the top three profiles including roles and experience, and capped tool results. It may request more tools for at most one extra round. Every result is capped at 360 tokens and the whole turn at 1,600.
+5. **Fresh sessions.** Each model call is a new OpenCode session containing only the current compact context. Prior turns live as six short history lines, not as an ever-growing transcript.
 
-Sessions are local rows mapped to OpenCode session ids. **New chat** creates both; **delete** removes both. The title becomes the first question.
+The answer is stored in local history and shown in the thread. The full design, wire format and measured savings are in [the harness document](harness.md).
 
-Replies stream token-by-token from the SSE bus into a live assistant bubble. A small custom markdown renderer keeps headings and bullets, turns full candidate names into inline avatar chips, and shows a blinking cursor while tokens arrive.
+Sessions are local rows. **New chat** creates one; **delete** removes it. The title becomes the first question. Replies from judgement questions appear as a complete answer after the tool rounds; the live bubble shows which local tools are running.
+
+**Why this matters at 2,000 candidates.** The old path sent four excerpts per question and paid for every previous prompt in the session. The harness sends a fixed-size tool menu, a prefetch of 3–10 metadata rows, and a capped result set. A lookup costs one bounded prompt over a compact tool result; a judgement question costs one bounded prompt regardless of how large the library or the conversation is.
 
 ## 7. Accuracy
 
@@ -251,6 +256,9 @@ The database is not the bottleneck. The chat model is — so we barely use it. R
 | Embed 2,000 resumes | 30–90 s one-time | `e5-small-v2` int8, ~10 chunks each, rayon across cores |
 | Stage-2 judging, top 30 | < 90 s first run, instant after | Parallel calls, cached per `(JD, candidate, model, prompt)` |
 | Scroll the candidate table | 60 fps | GPUI `UniformList`, virtualized by row |
+| Chat lookup (counts, profile, explicit list) | one bounded prompt | Local tools gather evidence; the model answers |
+| Chat evaluation (best, top, compare) | one model prompt + 3 researched profiles | Model judges experience and evidence |
+| Chat judgement (`why`, `summarise`) | one bounded prompt | Fresh session, 360-token result cap, 1,600-token turn budget |
 | Memory at 5,000 candidates | < 500 MB | Text in SQLite, PDFs on disk, pages in a 5-item LRU |
 
 Ingest is a **durable queue, but a light one**: every file is a row, every step is idempotent, and killing the app mid-import loses nothing. Files arrive continuously, so there is no global re-index step — FTS5 updates as documents land. Duplicate detection runs on file hash first, then fuzzy identity (email, phone, name + overlapping roles).
@@ -271,10 +279,13 @@ Ingest is a **durable queue, but a light one**: every file is a row, every step 
 ```sql
 files(id, sha256, path, mime, bytes, imported_at)
 documents(id, file_id, kind, text, extractor_version, confidence)
-candidates(id, name, email, phone, location, links_json, total_years,
-           headline, merged_into, created_at)
+candidates(id, name, email, phone, location, total_years,
+           headline, skills_json, summary, experience_json,
+           education_json, certifications_json, index_body,
+           text, file_name, created_at)
 candidate_documents(candidate_id, document_id, is_primary)
-candidate_notes(candidate_id, body_json, updated_at)
+candidate_notes(candidate_id, body_md, updated_at)
+chunks(id, candidate_id, idx, text, embedding BLOB, model, created_at)
 profiles(id, candidate_id, document_id, json, confidence,
          extractor_version, created_at)
 jobs(id, title, description, spec_json, weights_json, created_at, archived)
@@ -288,6 +299,8 @@ embeddings(id, owner_type, owner_id, chunk_index, model_id, dim,
 
 The embeddings table holds one row per resume section — a few tens of megabytes at 2,000 resumes, so cosine runs in memory with no index server. `breakdown_json` and `evidence_json` are what make the UI explainable: the Top 10 view is a rendering of these rows, not a separate computation.
 
+`experience_json`, `education_json`, and `certifications_json` are arrays on the candidate row: easy to inspect, easy to re-embed, and covered by FTS through `index_body`. The **Developer** screen reads the same tables read-only and renders blobs as `dim · L2 · first values`, so a malformed extraction is visible before it affects ranking.
+
 ## 10. Repository layout
 
 ```
@@ -298,10 +311,13 @@ crates/
   parse/     # PDF/DOCX/TXT, profile heuristics, isolated pdf helper
   embed/     # e5-small-v2, pooling, cosine
   ai/        # OpenCode transport, models, sessions, polling
-  pipeline/  # hybrid retrieval, prompt construction, headless ask
-  cli/       # seed, import, index, ask
+  harness/   # token-lean tool harness: tools, protocol, budget, opt-in local answers
+  mcp/       # local MCP server exposing the same tools for native tool calling
+  pipeline/  # retrieval primitives, prompt construction, headless ask
+  update/    # GitHub Releases check, verified download, bundle swap
+  cli/       # seed, import, index, reindex, tools, mcp, tool, db, tokens, ask
 assets/      # brand art; e5-small-v2 files (fetched by script)
-scripts/     # fetch-model.sh, run.sh
+scripts/     # fetch-model.*, run.sh, install-linux-deps.sh, package-{macos,linux,windows}.*, release.sh
 ```
 
 The roadmap's `ingest`, `rank`, and `eval` crates are folded into `store` and `pipeline` for now; they split when the JD ranker and accuracy harness land.
@@ -321,15 +337,24 @@ cargo run -r                  # app only, release build
 
 Use `./scripts/run.sh` when you need the PDF helper built too; it is what makes malformed PDFs safe.
 
+Packaged builds update themselves from GitHub Releases on macOS, Windows, and Linux. `./scripts/package-macos.sh`, `./scripts/package-linux.sh`, and `scripts/package-windows.ps1` produce the platform archives; `./scripts/release.sh patch --push` tags and publishes all of them through GitHub Actions. See [updates.md](updates.md) for the asset contract and security model.
+
 The headless path is testable without the window:
 
 ```bash
 cargo run -p shortlist-cli -- seed
 cargo run -p shortlist-cli -- index
+cargo run -p shortlist-cli -- reindex
+cargo run -p shortlist-cli -- tools
+cargo run -p shortlist-cli -- mcp install
+cargo run -p shortlist-cli -- tool find q=rust n=5
+cargo run -p shortlist-cli -- db chunks
+cargo run -p shortlist-cli -- tokens "Who has the strongest Rust background?"
 cargo run -p shortlist-cli -- ask "Who has the strongest Rust background?"
+cargo run -p shortlist-cli -- ask --plain "Summarise the backend profiles"
 ```
 
-The `cli` crate runs the exact retrieval and answer path without a window, so retrieval and prompt changes are testable in CI.
+`ask` sends every question to the model; the tools gather the compact evidence locally. `ask --plain` keeps the old excerpt path for comparison. Set `SHORTLIST_DATA_DIR` to point the CLI at a scratch library. The `cli` crate runs the exact retrieval, tool and answer paths without a window, so changes are testable in CI.
 
 ## 12. Roadmap
 
@@ -362,6 +387,7 @@ One developer, with the recruiter available about two hours a week for labelling
 - [ ] Installer under 100 MB per OS; idle RAM < 150 MB; < 500 MB with 5,000 candidates.
 - [ ] Every LLM call shows provider and model; identity fields stripped before sending.
 - [ ] Clean install from one package per OS.
+- [ ] An installed build on macOS, Windows, or Linux detects a newer GitHub release, verifies it, installs in place, and relaunches.
 - [ ] Export a client-ready top 10 (CSV + PDF).
 
 ## 14. Risks

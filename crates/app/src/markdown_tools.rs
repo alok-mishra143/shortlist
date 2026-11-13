@@ -3,8 +3,6 @@
 //! Every function takes UTF-8 text plus byte ranges and returns a new edit.
 //! Nothing here touches GPUI, the filesystem, or the store.
 
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 /// The Markdown block style of a line.

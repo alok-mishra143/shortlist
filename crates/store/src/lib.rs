@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use shortlist_core::{Candidate, ChatMessage, ChatSession, now_ms};
+use shortlist_core::{Candidate, CandidateLite, ChatMessage, ChatSession, now_ms};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -37,6 +37,12 @@ fn fts_query(raw: &str) -> String {
 fn row_to_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
     let skills_json: String = row.get("skills")?;
     let skills: Vec<String> = serde_json::from_str(&skills_json).unwrap_or_default();
+    let experience_json: String = row.get("experience")?;
+    let experience = serde_json::from_str(&experience_json).unwrap_or_default();
+    let education_json: String = row.get("education")?;
+    let education = serde_json::from_str(&education_json).unwrap_or_default();
+    let certifications_json: String = row.get("certifications")?;
+    let certifications = serde_json::from_str(&certifications_json).unwrap_or_default();
     Ok(Candidate {
         id: row.get("id")?,
         name: row.get("name")?,
@@ -47,11 +53,59 @@ fn row_to_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
         years: row.get("years")?,
         skills,
         summary: row.get("summary")?,
+        experience,
+        education,
+        certifications,
         text: row.get("text")?,
         file_name: row.get("file_name")?,
         created_at: row.get("created_at")?,
         is_demo: row.get::<_, i64>("is_demo")? != 0,
     })
+}
+
+/// Metadata-only column list. Keeps resume bodies out of overview queries.
+const LITE_COLUMNS: &str = "id, name, headline, location, email, phone, years, skills, summary, experience, education, certifications, file_name, created_at, is_demo";
+
+/// The same list, qualified for joins against the FTS table.
+const LITE_COLUMNS_QUALIFIED: &str = "c.id, c.name, c.headline, c.location, c.email, c.phone, c.years, c.skills, c.summary, c.experience, c.education, c.certifications, c.file_name, c.created_at, c.is_demo";
+
+fn row_to_lite(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateLite> {
+    let skills_json: String = row.get("skills")?;
+    let experience_json: String = row.get("experience")?;
+    let education_json: String = row.get("education")?;
+    let certifications_json: String = row.get("certifications")?;
+    Ok(CandidateLite {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        headline: row.get("headline")?,
+        location: row.get("location")?,
+        email: row.get("email")?,
+        phone: row.get("phone")?,
+        years: row.get("years")?,
+        skills: serde_json::from_str(&skills_json).unwrap_or_default(),
+        summary: row.get("summary")?,
+        experience: serde_json::from_str(&experience_json).unwrap_or_default(),
+        education: serde_json::from_str(&education_json).unwrap_or_default(),
+        certifications: serde_json::from_str(&certifications_json).unwrap_or_default(),
+        file_name: row.get("file_name")?,
+        created_at: row.get("created_at")?,
+        is_demo: row.get::<_, i64>("is_demo")? != 0,
+    })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, declaration: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|name| name.ok())
+        .collect();
+    if !existing.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -81,6 +135,7 @@ impl Store {
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
 
             CREATE TABLE IF NOT EXISTS candidates (
                 id TEXT PRIMARY KEY,
@@ -92,6 +147,10 @@ impl Store {
                 years REAL NOT NULL DEFAULT 0,
                 skills TEXT NOT NULL DEFAULT '[]',
                 summary TEXT NOT NULL DEFAULT '',
+                experience TEXT NOT NULL DEFAULT '[]',
+                education TEXT NOT NULL DEFAULT '[]',
+                certifications TEXT NOT NULL DEFAULT '[]',
+                index_body TEXT NOT NULL DEFAULT '',
                 text TEXT NOT NULL DEFAULT '',
                 file_name TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
@@ -147,6 +206,20 @@ impl Store {
             );
             "#,
         )?;
+        for (column, declaration) in [
+            ("experience", "TEXT NOT NULL DEFAULT '[]'"),
+            ("education", "TEXT NOT NULL DEFAULT '[]'"),
+            ("certifications", "TEXT NOT NULL DEFAULT '[]'"),
+            ("index_body", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            ensure_column(&conn, "candidates", column, declaration)?;
+        }
+        // Older libraries had no profile index body; the resume text is a safe
+        // seed until the next update or re-read refreshes it.
+        conn.execute(
+            "UPDATE candidates SET index_body = text WHERE index_body = ''",
+            [],
+        )?;
         Ok(())
     }
 
@@ -159,13 +232,32 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let skills = serde_json::to_string(&c.skills)?;
+        let experience = serde_json::to_string(&c.experience)?;
+        let education = serde_json::to_string(&c.education)?;
+        let certifications = serde_json::to_string(&c.certifications)?;
+        let index_body = c.search_body();
         tx.execute(
             "INSERT OR REPLACE INTO candidates
-             (id, name, headline, location, email, phone, years, skills, summary, text, file_name, created_at, is_demo)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             (id, name, headline, location, email, phone, years, skills, summary, experience, education, certifications, index_body, text, file_name, created_at, is_demo)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
-                c.id, c.name, c.headline, c.location, c.email, c.phone, c.years, skills,
-                c.summary, c.text, c.file_name, c.created_at, c.is_demo as i64
+                c.id,
+                c.name,
+                c.headline,
+                c.location,
+                c.email,
+                c.phone,
+                c.years,
+                skills,
+                c.summary,
+                experience,
+                education,
+                certifications,
+                index_body,
+                c.text,
+                c.file_name,
+                c.created_at,
+                c.is_demo as i64
             ],
         )?;
         let note: Option<String> = tx
@@ -176,8 +268,8 @@ impl Store {
             )
             .optional()?;
         let body = match note {
-            Some(note) => format!("{}{}{}", c.text, NOTES_SECTION, note),
-            None => c.text.clone(),
+            Some(note) => format!("{}{}{}", c.search_body(), NOTES_SECTION, note),
+            None => c.search_body(),
         };
         tx.execute(
             "DELETE FROM candidate_fts WHERE candidate_id = ?1",
@@ -231,6 +323,77 @@ impl Store {
         Ok(stmt.query_row(params![id], row_to_candidate).optional()?)
     }
 
+    /// Metadata for one candidate, without the resume body.
+    pub fn lite(&self, id: &str) -> Result<Option<CandidateLite>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LITE_COLUMNS} FROM candidates WHERE id = ?1"
+        ))?;
+        Ok(stmt.query_row(params![id], row_to_lite).optional()?)
+    }
+
+    /// The whole library's metadata, newest first. Bodies stay in SQLite.
+    pub fn list_lite(&self, limit: usize, offset: usize) -> Result<Vec<CandidateLite>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LITE_COLUMNS} FROM candidates ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
+        ))?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], row_to_lite)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Field-weighted BM25 search returning metadata only.
+    pub fn search_lite(&self, query: &str, limit: usize) -> Result<Vec<CandidateLite>> {
+        if query.trim().is_empty() {
+            return self.list_lite(limit, 0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LITE_COLUMNS_QUALIFIED} FROM candidate_fts f
+             JOIN candidates c ON c.id = f.candidate_id
+             WHERE candidate_fts MATCH ?1
+             ORDER BY bm25(candidate_fts), c.created_at DESC
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![fts_query(query), limit as i64], row_to_lite)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Exact number of candidates matching a lexical query, ignoring the
+    /// retrieval pool limit.
+    pub fn count_matching(&self, query: &str) -> Result<usize> {
+        if query.trim().is_empty() {
+            return Ok(self.count()? as usize);
+        }
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM candidate_fts WHERE candidate_fts MATCH ?1",
+            params![fts_query(query)],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn candidate_text_chars(&self, id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let chars: i64 = conn.query_row(
+            "SELECT COALESCE(length(text), 0) FROM candidates WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(chars.max(0) as usize)
+    }
+
+    pub fn total_text_chars(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let chars: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length(text)), 0) FROM candidates",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(chars.max(0) as usize)
+    }
+
     pub fn update_candidate_name(&self, id: &str, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -246,11 +409,16 @@ impl Store {
 
     pub fn update_candidate(&self, candidate: &Candidate) -> Result<()> {
         let skills = serde_json::to_string(&candidate.skills)?;
+        let experience = serde_json::to_string(&candidate.experience)?;
+        let education = serde_json::to_string(&candidate.education)?;
+        let certifications = serde_json::to_string(&candidate.certifications)?;
+        let index_body = candidate.search_body();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE candidates SET name=?1, headline=?2, location=?3, email=?4, phone=?5,
-             years=?6, skills=?7, summary=?8 WHERE id=?9",
+             years=?6, skills=?7, summary=?8, experience=?9, education=?10, certifications=?11,
+             index_body=?12 WHERE id=?13",
             params![
                 candidate.name,
                 candidate.headline,
@@ -260,15 +428,31 @@ impl Store {
                 candidate.years,
                 skills,
                 candidate.summary,
+                experience,
+                education,
+                certifications,
+                index_body,
                 candidate.id
             ],
         )?;
+        let note: Option<String> = tx
+            .query_row(
+                "SELECT body FROM candidate_notes WHERE candidate_id = ?1",
+                params![candidate.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let body = match note {
+            Some(note) => format!("{}{}{}", candidate.search_body(), NOTES_SECTION, note),
+            None => candidate.search_body(),
+        };
         tx.execute(
-            "UPDATE candidate_fts SET name=?1, headline=?2, skills=?3 WHERE candidate_id=?4",
+            "UPDATE candidate_fts SET name=?1, headline=?2, skills=?3, body=?4 WHERE candidate_id=?5",
             params![
                 candidate.name,
                 candidate.headline,
                 serde_json::to_string(&candidate.skills)?,
+                body,
                 candidate.id
             ],
         )?;
@@ -313,7 +497,7 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE candidate_fts
-             SET body = (SELECT text FROM candidates WHERE id = ?1) || ?2
+             SET body = COALESCE((SELECT index_body FROM candidates WHERE id = ?1), '') || ?2
              WHERE candidate_id = ?1
                AND EXISTS (SELECT 1 FROM candidates WHERE id = ?1)",
             params![candidate_id, format!("{NOTES_SECTION}{body}")],
@@ -331,7 +515,7 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE candidate_fts
-             SET body = COALESCE((SELECT text FROM candidates WHERE id = ?1), '')
+             SET body = COALESCE((SELECT index_body FROM candidates WHERE id = ?1), '')
              WHERE candidate_id = ?1",
             params![candidate_id],
         )?;
@@ -578,13 +762,138 @@ impl Store {
             if self.candidate(&c.id)?.is_some() {
                 continue;
             }
-            let chunks = shortlist_core::chunk_text(&c.text, 160, 24);
+            let chunks = shortlist_core::chunk_text(&c.index_text(), 160, 24);
             self.insert_candidate(&c, &chunks)?;
             let _ = idx;
             added += 1;
         }
         Ok(added)
     }
+}
+
+/// Read-only table inspection for the Developer screen. The list is a
+/// whitelist: never interpolate a user-supplied table name into SQL.
+pub const INSPECTABLE_TABLES: &[&str] = &[
+    "candidates",
+    "candidate_fts",
+    "chunks",
+    "candidate_notes",
+    "chat_sessions",
+    "chat_messages",
+    "settings",
+];
+
+#[derive(Clone, Debug)]
+pub struct DbColumn {
+    pub name: String,
+    pub kind: String,
+    pub primary: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct DbTable {
+    pub name: String,
+    pub total: i64,
+    pub columns: Vec<DbColumn>,
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Store {
+    pub fn table_counts(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        for table in INSPECTABLE_TABLES {
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            out.push((table.to_string(), count));
+        }
+        Ok(out)
+    }
+
+    pub fn inspect_table(&self, table: &str, limit: usize) -> Result<DbTable> {
+        if !INSPECTABLE_TABLES.contains(&table) {
+            return Err(anyhow::anyhow!("table not inspectable: {table}"));
+        }
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns: Vec<DbColumn> = stmt
+            .query_map([], |row| {
+                Ok(DbColumn {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    primary: row.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .filter_map(|row| row.ok())
+            .collect();
+        let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM {table} ORDER BY rowid DESC LIMIT ?1"
+        ))?;
+        let column_count = stmt.column_count();
+        let mut query = stmt.query(params![limit as i64])?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next()? {
+            let mut cells = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                cells.push(render_value(row.get_ref(index)?));
+            }
+            rows.push(cells);
+        }
+        Ok(DbTable {
+            name: table.to_string(),
+            total,
+            columns,
+            rows,
+        })
+    }
+}
+
+fn render_value(value: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => format!("{value:.4}"),
+        ValueRef::Text(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            let chars = text.chars().count();
+            if chars > 600 {
+                let clipped: String = text.chars().take(600).collect();
+                format!("{clipped}… ({chars} chars)")
+            } else {
+                text.to_string()
+            }
+        }
+        ValueRef::Blob(bytes) => embedding_preview(bytes),
+    }
+}
+
+fn embedding_preview(bytes: &[u8]) -> String {
+    if !bytes.len().is_multiple_of(4) || bytes.is_empty() {
+        return format!("BLOB ({} bytes)", bytes.len());
+    }
+    let dimensions = bytes.len() / 4;
+    let mut norm = 0.0f32;
+    let mut values = Vec::new();
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        norm += value * value;
+        if index < 8 {
+            values.push(format!("{value:.4}"));
+        }
+    }
+    format!(
+        "BLOB · dim={dimensions} · L2={:.3} · [{}{}]",
+        norm.sqrt(),
+        values.join(", "),
+        if dimensions > 8 { ", …" } else { "" }
+    )
 }
 
 pub fn file_hash(bytes: &[u8]) -> String {
@@ -760,6 +1069,16 @@ fn demo_candidates() -> Vec<Candidate> {
             years,
             skills: skills.iter().map(|s| s.to_string()).collect(),
             summary: summary.into(),
+            experience: vec![shortlist_core::Experience {
+                title: headline.into(),
+                company: String::new(),
+                start: String::new(),
+                end: "Present".into(),
+                years,
+                description: summary.into(),
+            }],
+            education: Vec::new(),
+            certifications: Vec::new(),
             text: format!(
                 "{name}\n{headline}\n{location}\n\nSummary\n{summary}\n\nSkills\n{}\n\nExperience\n{headline} with {years} years of experience. Worked on production systems, partnered with product and design, and owned delivery end to end.",
                 skills.join(", ")
@@ -875,5 +1194,100 @@ mod tests {
         assert_eq!(store.messages(&session.id).unwrap().len(), 1);
         store.delete_session(&session.id).unwrap();
         assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lite_queries_skip_resume_bodies() {
+        let store = Store::open_in_memory().unwrap();
+        store.seed_demo().unwrap();
+        assert_eq!(store.list_lite(100, 0).unwrap().len(), 12);
+        let matches = store.search_lite("rust", 10).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(store.count_matching("rust").unwrap(), 3);
+        let sarah = store.lite("demo-01").unwrap().unwrap();
+        assert_eq!(sarah.name, "Sarah Chen");
+        assert_eq!(sarah.skills.len(), 6);
+        assert!(store.candidate_text_chars("demo-01").unwrap() > 100);
+        assert!(store.total_text_chars().unwrap() > 1_000);
+    }
+
+    #[test]
+    fn structured_career_fields_round_trip_and_search() {
+        let store = Store::open_in_memory().unwrap();
+        store.seed_demo().unwrap();
+        let mut candidate = store.candidate("demo-01").unwrap().unwrap();
+        candidate.experience = vec![shortlist_core::Experience {
+            title: "Staff Engineer".into(),
+            company: "Ledger Co".into(),
+            start: "2020".into(),
+            end: "Present".into(),
+            years: 6.0,
+            description: "Built payment rails".into(),
+        }];
+        candidate.education = vec![shortlist_core::Education {
+            degree: "B.Tech".into(),
+            institution: "University of London".into(),
+            year: "2014".into(),
+        }];
+        candidate.certifications = vec!["AWS Solutions Architect".into()];
+        store.update_candidate(&candidate).unwrap();
+
+        let loaded = store.lite("demo-01").unwrap().unwrap();
+        assert_eq!(loaded.experience[0].company, "Ledger Co");
+        assert_eq!(loaded.education[0].institution, "University of London");
+        assert_eq!(loaded.certifications[0], "AWS Solutions Architect");
+        let hits = store.search_lite("Ledger Co", 10).unwrap();
+        assert!(hits.iter().any(|hit| hit.id == "demo-01"));
+
+        let chunks = shortlist_core::chunk_text(&candidate.index_text(), 180, 28);
+        store
+            .save_chunks_with_vectors("demo-01", &chunks, &[], "")
+            .unwrap();
+        let table = store.inspect_table("chunks", 5).unwrap();
+        assert!(
+            table
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.contains("Built payment rails")),
+            "profile text should be in the re-chunked index"
+        );
+    }
+
+    #[test]
+    fn developer_inspector_shows_columns_and_embedding_shape() {
+        let store = Store::open_in_memory().unwrap();
+        store.seed_demo().unwrap();
+        store
+            .save_chunks_with_vectors(
+                "demo-01",
+                &["a test chunk".into()],
+                &[vec![0.1, 0.2, 0.3, 0.4]],
+                "test-model",
+            )
+            .unwrap();
+        let candidates = store.inspect_table("candidates", 5).unwrap();
+        assert!(
+            candidates
+                .columns
+                .iter()
+                .any(|column| column.name == "experience")
+        );
+        assert!(
+            candidates
+                .columns
+                .iter()
+                .any(|column| column.name == "index_body")
+        );
+        let chunks = store.inspect_table("chunks", 5).unwrap();
+        let embedding = chunks
+            .rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|value| value.starts_with("BLOB"))
+            .expect("an embedding preview");
+        assert!(embedding.contains("dim=4"), "{embedding}");
+        assert!(embedding.contains("L2="), "{embedding}");
+        assert!(store.inspect_table("sqlite_master", 5).is_err());
     }
 }

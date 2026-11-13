@@ -1,0 +1,17 @@
+[package]
+name = "shortlist-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shortlist-mcp"
+path = "src/main.rs"
+
+[dependencies]
+shortlist-core = { path = "../core" }
+shortlist-store = { path = "../store" }
+shortlist-embed = { path = "../embed" }
+shortlist-harness = { path = "../harness" }
+anyhow.workspace = true
+serde_json.workspace = true

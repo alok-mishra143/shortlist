@@ -9,7 +9,7 @@ if [[ ! -f assets/models/e5-small-v2/model_quantized.onnx ]]; then
   ./scripts/fetch-model.sh
 fi
 
-# Build the app and the isolated PDF helper together.
-cargo build -p shortlist-app -p shortlist-parse --bins
+# Build the app, the isolated PDF helper, and the local MCP server together.
+cargo build -p shortlist-app -p shortlist-parse -p shortlist-mcp --bins
 
 exec ./target/debug/shortlist "$@"

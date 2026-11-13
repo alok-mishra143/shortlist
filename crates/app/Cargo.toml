@@ -17,6 +17,7 @@ shortlist-parse = { path = "../parse" }
 shortlist-ai = { path = "../ai" }
 shortlist-embed = { path = "../embed" }
 shortlist-pipeline = { path = "../pipeline" }
+shortlist-update = { path = "../update" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

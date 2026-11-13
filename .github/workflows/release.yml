@@ -1,0 +1,274 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the workspace version
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Cargo.toml says $version but the tag says $GITHUB_REF_NAME. Bump the version first."
+            exit 1
+          fi
+          echo "Releasing Shortlist $version"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verify
+
+      - name: Test the update protocol
+        run: cargo test -p shortlist-update --quiet
+
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon
+          - runner: macos-15
+            arch: aarch64
+          # Intel
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/models/e5-small-v2
+          key: e5-small-v2-v1
+
+      - name: Package app
+        env:
+          # Fork releases should update from the fork, not upstream.
+          SHORTLIST_UPDATE_REPO: ${{ github.repository }}
+        run: ./scripts/package-macos.sh
+
+      - name: Verify packaged asset
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          asset="dist/Shortlist-macos-${{ matrix.arch }}.zip"
+          test -s "$asset"
+          test -s "$asset.sha256"
+          plutil -p dist/Shortlist.app/Contents/Info.plist | grep -q "\"CFBundleShortVersionString\" => \"$version\""
+          unzip -l "$asset" | grep -q "Shortlist.app/Contents/MacOS/shortlist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/Shortlist-macos-${{ matrix.arch }}.zip
+            dist/Shortlist-macos-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows ${{ matrix.arch }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/models/e5-small-v2
+          key: e5-small-v2-v1
+
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @("scripts/package-windows.ps1", "scripts/fetch-model.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file).Path, [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file: $_" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Test the update protocol
+        run: cargo test -p shortlist-update --quiet
+
+      - name: Package app
+        shell: pwsh
+        env:
+          SHORTLIST_UPDATE_REPO: ${{ github.repository }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/package-windows.ps1
+
+      - name: Verify packaged asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $asset = "dist/Shortlist-windows-${{ matrix.arch }}.zip"
+          if (-not (Test-Path -LiteralPath $asset)) { throw "missing $asset" }
+          if (-not (Test-Path -LiteralPath "$asset.sha256")) { throw "missing $asset.sha256" }
+
+          $verify = "dist/verify-windows"
+          if (Test-Path -LiteralPath $verify) { Remove-Item -LiteralPath $verify -Recurse -Force }
+          Expand-Archive -LiteralPath $asset -DestinationPath $verify -Force
+
+          foreach ($path in @(
+            "$verify/Shortlist/shortlist.exe",
+            "$verify/Shortlist/shortlist-pdf.exe",
+            "$verify/Shortlist/shortlist-install.json"
+          )) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing $path in archive" }
+          }
+          $manifest = Get-Content -LiteralPath "$verify/Shortlist/shortlist-install.json" -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $version) { throw "archive version $($manifest.version) != $version" }
+          if ($manifest.platform -ne "windows") { throw "archive platform is $($manifest.platform)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            dist/Shortlist-windows-${{ matrix.arch }}.zip
+            dist/Shortlist-windows-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: ./scripts/install-linux-deps.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/models/e5-small-v2
+          key: e5-small-v2-v1
+
+      - name: Package app
+        env:
+          SHORTLIST_UPDATE_REPO: ${{ github.repository }}
+        run: ./scripts/package-linux.sh
+
+      - name: Verify packaged asset
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          asset="dist/Shortlist-linux-${{ matrix.arch }}.zip"
+          test -s "$asset"
+          test -s "$asset.sha256"
+          unzip -l "$asset" | grep -q "Shortlist/shortlist$"
+          unzip -l "$asset" | grep -q "Shortlist/shortlist-pdf$"
+          unzip -p "$asset" Shortlist/shortlist-install.json | grep -q "\"version\": \"$version\""
+          test -x dist/Shortlist/shortlist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/Shortlist-linux-${{ matrix.arch }}.zip
+            dist/Shortlist-linux-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.zip.sha256 > checksums.txt
+          rm -f *.zip.sha256
+          cat checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          assets=(
+            dist/Shortlist-macos-aarch64.zip
+            dist/Shortlist-macos-x86_64.zip
+            dist/Shortlist-windows-x86_64.zip
+            dist/Shortlist-linux-x86_64.zip
+            dist/checksums.txt
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Re-running a failed publish should replace the assets, not fail.
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh release edit "$GITHUB_REF_NAME" --latest
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Shortlist $version" \
+              --generate-notes \
+              --latest \
+              --verify-tag \
+              "${assets[@]}"
+          fi

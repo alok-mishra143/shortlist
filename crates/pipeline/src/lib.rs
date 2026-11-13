@@ -5,6 +5,7 @@ use std::time::Duration;
 use shortlist_ai::OpenCode;
 use shortlist_core::{Candidate, ModelRef, now_ms};
 use shortlist_embed::{Embedder, cosine};
+use shortlist_harness::{Config, Harness, OpenCodeModel, RunOptions, RunReport};
 use shortlist_store::Store;
 
 /// Reciprocal-rank fusion of BM25 and vector retrieval. At this scale this is
@@ -134,6 +135,129 @@ pub fn ask(
     let result = opencode.wait_for_reply(&session, after, Duration::from_secs(180));
     let _ = opencode.delete_session(&session);
     result
+}
+
+/// The token-lean path: the model calls local tools instead of receiving
+/// resume excerpts. One fresh OpenCode session per model call keeps the context
+/// bounded no matter how long the chat gets.
+pub fn ask_with_tools(
+    store: &Store,
+    embedder: Option<&Embedder>,
+    model: Option<&ModelRef>,
+    question: &str,
+    history: &[(String, String)],
+) -> Result<RunReport> {
+    ask_with_tools_report(store, embedder, model, question, history, None)
+}
+
+/// As [`ask_with_tools`], with an optional progress feed for the UI.
+pub fn ask_with_tools_report(
+    store: &Store,
+    embedder: Option<&Embedder>,
+    model: Option<&ModelRef>,
+    question: &str,
+    history: &[(String, String)],
+    progress: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> Result<RunReport> {
+    let harness = Harness::new(store, embedder, Config::default());
+    harness.run(
+        &OpenCodeModel::new(model),
+        question,
+        RunOptions { history, progress },
+    )
+}
+
+/// A compact, model-free summary of what the harness would save on this
+/// question. Used by `shortlist-cli tokens`.
+pub fn token_report(
+    store: &Store,
+    embedder: Option<&Embedder>,
+    question: &str,
+) -> Result<TokenReport> {
+    use shortlist_harness::{Budget, Call, Registry, ToolContext, estimate_tokens};
+
+    let harness = Harness::new(store, embedder, Config::default());
+    let mut ctx = ToolContext::new(store, embedder, Budget::new(20_000));
+    let registry = Registry::builtin();
+    let calls = harness.prefetch(question)?;
+    let mut tool_text = String::new();
+    let mut has_shortlist = false;
+    for call in &calls {
+        has_shortlist |= call.tool == "shortlist";
+        if let Ok(result) = registry.run(&mut ctx, call) {
+            tool_text.push_str(&result.body);
+            tool_text.push('\n');
+        }
+    }
+    // Ranking questions also carry a research pack; report it honestly.
+    if !harness.prefers_local_answer(question) && has_shortlist {
+        let handles: Vec<String> = ctx
+            .refs
+            .entries()
+            .iter()
+            .take(3)
+            .map(|entry| entry.handle.clone())
+            .collect();
+        for handle in handles {
+            let call = Call {
+                tool: "get".into(),
+                args: vec![
+                    ("id".into(), handle),
+                    (
+                        "f".into(),
+                        "headline,yrs,loc,skills,summary,experience,education".into(),
+                    ),
+                ],
+            };
+            if let Ok(result) = registry.run(&mut ctx, &call) {
+                tool_text.push_str(&result.body);
+                tool_text.push('\n');
+            }
+        }
+    }
+    let old_context = build_context(store, embedder, question, 4);
+    let old_prompt = build_prompt(&old_context, question);
+    let direct = harness.local_answer(question)?.is_some();
+    let prompt_tokens = if direct {
+        0
+    } else {
+        let mut tokens = estimate_tokens(harness.system()) + estimate_tokens(question);
+        if tool_text.is_empty() {
+            tokens += estimate_tokens(harness.digest());
+        }
+        tokens
+    };
+    Ok(TokenReport {
+        old_tokens: estimate_tokens(&old_prompt),
+        old_chars: old_prompt.len(),
+        context_chars: old_context.len(),
+        prompt_tokens,
+        tool_tokens: if direct {
+            0
+        } else {
+            estimate_tokens(&tool_text)
+        },
+        tool_chars: tool_text.len(),
+        raw_chars: store.total_text_chars()?,
+        direct,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenReport {
+    /// Tokens the old excerpt-stuffing prompt would send.
+    pub old_tokens: usize,
+    pub old_chars: usize,
+    pub context_chars: usize,
+    /// Tokens the harness system prompt and digest cost.
+    pub prompt_tokens: usize,
+    /// Tokens representative tool results cost.
+    pub tool_tokens: usize,
+    pub tool_chars: usize,
+    /// Characters of resume text the library holds.
+    pub raw_chars: usize,
+    /// Direct local rendering (opt-in) needs no model tokens at all.
+    pub direct: bool,
 }
 
 #[cfg(test)]

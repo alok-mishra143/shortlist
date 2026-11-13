@@ -1,5 +1,92 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Experience {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub end: String,
+    #[serde(default, deserialize_with = "deserialize_f32")]
+    pub years: f32,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl Experience {
+    pub fn is_current(&self) -> bool {
+        let end = self.end.trim().to_lowercase();
+        end.is_empty()
+            || end.contains("present")
+            || end.contains("current")
+            || end.contains("now")
+            || end.contains("ongoing")
+    }
+
+    /// "Senior Backend Engineer at Stripe · 2021 – Present"
+    pub fn label(&self) -> String {
+        let mut out = String::new();
+        if !self.title.is_empty() {
+            out.push_str(&self.title);
+        }
+        if !self.company.is_empty() {
+            if !out.is_empty() {
+                out.push_str(" at ");
+            }
+            out.push_str(&self.company);
+        }
+        let dates = match (self.start.trim(), self.end.trim()) {
+            ("", "") => String::new(),
+            (start, "") => start.to_string(),
+            ("", end) => end.to_string(),
+            (start, end) => format!("{start} – {end}"),
+        };
+        if !dates.is_empty() {
+            if !out.is_empty() {
+                out.push_str(" · ");
+            }
+            out.push_str(&dates);
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Education {
+    #[serde(default)]
+    pub degree: String,
+    #[serde(default)]
+    pub institution: String,
+    #[serde(default)]
+    pub year: String,
+}
+
+impl Education {
+    pub fn label(&self) -> String {
+        match (self.degree.trim(), self.institution.trim()) {
+            ("", "") => String::new(),
+            (degree, "") => degree.to_string(),
+            ("", institution) => institution.to_string(),
+            (degree, institution) => format!("{degree} · {institution}"),
+        }
+    }
+}
+
+fn deserialize_f32<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number.as_f64().unwrap_or(0.0) as f32,
+        Some(serde_json::Value::String(value)) => value.trim().parse::<f32>().unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
@@ -12,6 +99,12 @@ pub struct Candidate {
     pub years: f32,
     pub skills: Vec<String>,
     pub summary: String,
+    #[serde(default)]
+    pub experience: Vec<Experience>,
+    #[serde(default)]
+    pub education: Vec<Education>,
+    #[serde(default)]
+    pub certifications: Vec<String>,
     pub text: String,
     pub file_name: String,
     pub created_at: i64,
@@ -27,6 +120,307 @@ impl Candidate {
             }
         }
         if out.is_empty() { "?".into() } else { out }
+    }
+
+    pub fn current_role(&self) -> Option<&Experience> {
+        self.experience.iter().find(|role| role.is_current())
+    }
+
+    /// Everything in the profile that should be searchable, without the notes.
+    pub fn search_body(&self) -> String {
+        let mut out = String::new();
+        for value in [
+            self.headline.as_str(),
+            self.location.as_str(),
+            &self.skills.join(", "),
+            self.summary.as_str(),
+        ] {
+            if !value.trim().is_empty() {
+                out.push_str(value);
+                out.push('\n');
+            }
+        }
+        for role in &self.experience {
+            let label = role.label();
+            if !label.is_empty() {
+                out.push_str(&label);
+                out.push('\n');
+            }
+            if !role.description.trim().is_empty() {
+                out.push_str(&role.description);
+                out.push('\n');
+            }
+        }
+        for education in &self.education {
+            let label = education.label();
+            if !label.is_empty() {
+                out.push_str(&label);
+                out.push('\n');
+            }
+        }
+        if !self.certifications.is_empty() {
+            out.push_str(&self.certifications.join(", "));
+            out.push('\n');
+        }
+        out.push_str(&self.text);
+        out
+    }
+
+    /// The text that is chunked and embedded. Profile fields first, so a
+    /// re-read changes the vectors even when the resume body is unchanged.
+    pub fn index_text(&self) -> String {
+        self.search_body()
+    }
+
+    /// Embeddings should follow the recruiter note too; it is first-hand
+    /// context and the chat can cite it.
+    pub fn index_text_with_note(&self, note: Option<&str>) -> String {
+        let mut text = self.index_text();
+        if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+            text.push_str("\nRecruiter notes:\n");
+            text.push_str(note);
+        }
+        text
+    }
+
+    pub fn seniority(&self) -> f32 {
+        seniority_score(&self.headline).max(
+            self.experience
+                .iter()
+                .map(|role| seniority_score(&role.title))
+                .fold(0.0, f32::max),
+        )
+    }
+
+    pub fn recency(&self) -> f32 {
+        recency_score(&self.experience)
+    }
+
+    pub fn is_leader(&self) -> bool {
+        leadership_title(&self.headline)
+            || self
+                .experience
+                .iter()
+                .any(|role| leadership_title(&role.title))
+    }
+}
+
+/// 0–1 seniority from a job title. Deliberately conservative and role-based;
+/// it never looks at identity fields.
+pub fn seniority_score(title: &str) -> f32 {
+    let title = title.to_lowercase();
+    let markers: &[(f32, &[&str])] = &[
+        (
+            1.0,
+            &[
+                "principal",
+                "staff",
+                "distinguished",
+                "architect",
+                "chief",
+                "vp",
+                "vice president",
+                "head of",
+                "director",
+            ],
+        ),
+        (0.85, &["manager", "lead", "supervisor"]),
+        (0.7, &["senior", "sr."]),
+        (
+            0.5,
+            &[
+                "engineer",
+                "developer",
+                "designer",
+                "analyst",
+                "scientist",
+                "consultant",
+                "specialist",
+            ],
+        ),
+        (0.2, &["junior", "associate", "intern", "trainee", "entry"]),
+    ];
+    markers
+        .iter()
+        .find(|(_, words)| words.iter().any(|word| title.contains(word)))
+        .map(|(score, _)| *score)
+        .unwrap_or(0.45)
+}
+
+pub fn leadership_title(title: &str) -> bool {
+    let title = title.to_lowercase();
+    [
+        "manager",
+        "lead",
+        "director",
+        "head of",
+        "vp",
+        "chief",
+        "supervisor",
+    ]
+    .iter()
+    .any(|word| title.contains(word))
+}
+
+/// How current the candidate's career is, 0–1. A current role scores 1.0.
+pub fn recency_score(experience: &[Experience]) -> f32 {
+    if experience.is_empty() {
+        return 0.5;
+    }
+    if experience.iter().any(Experience::is_current) {
+        return 1.0;
+    }
+    let now = current_year();
+    let latest = experience
+        .iter()
+        .filter_map(|role| last_year(&role.end).or_else(|| last_year(&role.start)))
+        .max();
+    match latest {
+        Some(year) => (1.0 - (now - year).max(0) as f32 * 0.12).clamp(0.1, 1.0),
+        None => 0.5,
+    }
+}
+
+/// Compact role history for prompts and the detail drawer.
+pub fn experience_summary(experience: &[Experience], max_roles: usize, max_chars: usize) -> String {
+    experience
+        .iter()
+        .take(max_roles)
+        .map(|role| {
+            let mut text = role.label();
+            if !role.description.trim().is_empty() {
+                if !text.is_empty() {
+                    text.push_str(": ");
+                }
+                text.push_str(role.description.trim());
+            }
+            if text.chars().count() > max_chars {
+                text = text.chars().take(max_chars).collect::<String>();
+                text.push('…');
+            }
+            text
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Share of the requested terms that appear in the candidate's roles.
+pub fn career_relevance(experience: &[Experience], terms: &[String]) -> f32 {
+    let terms: Vec<String> = terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.len() >= 3)
+        .collect();
+    if terms.is_empty() || experience.is_empty() {
+        return 0.0;
+    }
+    let corpus = experience
+        .iter()
+        .map(|role| {
+            format!(
+                "{} {} {} {}",
+                role.title, role.company, role.description, role.start
+            )
+            .to_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hits = terms
+        .iter()
+        .filter(|term| {
+            corpus.contains(term.as_str())
+                || (term.ends_with('s')
+                    && term.len() > 4
+                    && corpus.contains(&term[..term.len() - 1]))
+        })
+        .count();
+    hits as f32 / terms.len() as f32
+}
+
+fn last_year(value: &str) -> Option<i32> {
+    value
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .filter_map(|part| part.parse::<i32>().ok())
+        .max()
+}
+
+fn current_year() -> i32 {
+    1970 + (now_ms() / 31_556_952_000) as i32
+}
+
+/// The metadata half of a candidate. Everything except the resume text, so a
+/// whole library can be ranked and summarised without ever paying for the
+/// bodies. The tool harness works exclusively in this shape.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CandidateLite {
+    pub id: String,
+    pub name: String,
+    pub headline: String,
+    pub location: String,
+    pub email: String,
+    pub phone: String,
+    pub years: f32,
+    pub skills: Vec<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub experience: Vec<Experience>,
+    #[serde(default)]
+    pub education: Vec<Education>,
+    #[serde(default)]
+    pub certifications: Vec<String>,
+    pub file_name: String,
+    pub created_at: i64,
+    pub is_demo: bool,
+}
+
+impl CandidateLite {
+    pub fn current_role(&self) -> Option<&Experience> {
+        self.experience.iter().find(|role| role.is_current())
+    }
+
+    pub fn seniority(&self) -> f32 {
+        seniority_score(&self.headline).max(
+            self.experience
+                .iter()
+                .map(|role| seniority_score(&role.title))
+                .fold(0.0, f32::max),
+        )
+    }
+
+    pub fn recency(&self) -> f32 {
+        recency_score(&self.experience)
+    }
+
+    pub fn is_leader(&self) -> bool {
+        leadership_title(&self.headline)
+            || self
+                .experience
+                .iter()
+                .any(|role| leadership_title(&role.title))
+    }
+}
+
+impl From<&Candidate> for CandidateLite {
+    fn from(c: &Candidate) -> Self {
+        Self {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            headline: c.headline.clone(),
+            location: c.location.clone(),
+            email: c.email.clone(),
+            phone: c.phone.clone(),
+            years: c.years,
+            skills: c.skills.clone(),
+            summary: c.summary.clone(),
+            experience: c.experience.clone(),
+            education: c.education.clone(),
+            certifications: c.certifications.clone(),
+            file_name: c.file_name.clone(),
+            created_at: c.created_at,
+            is_demo: c.is_demo,
+        }
     }
 }
 
@@ -68,6 +462,11 @@ pub enum Role {
 }
 
 pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SHORTLIST_DATA_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
     if let Some(base) = directories::BaseDirs::new() {
         base.data_dir().join("Shortlist")
     } else {
@@ -226,6 +625,9 @@ mod tests {
             years: 0.0,
             skills: Vec::new(),
             summary: String::new(),
+            experience: Vec::new(),
+            education: Vec::new(),
+            certifications: Vec::new(),
             text: String::new(),
             file_name: String::new(),
             created_at: 0,
@@ -265,5 +667,57 @@ mod tests {
             "{linked}"
         );
         assert!(!linked.contains("↗"));
+    }
+
+    #[test]
+    fn seniority_and_recency_are_bounded() {
+        assert!(seniority_score("Principal Engineer") > seniority_score("Software Engineer"));
+        assert!(seniority_score("Engineering Manager") > seniority_score("Intern"));
+        assert_eq!(seniority_score("Something Else"), 0.45);
+
+        let current = vec![Experience {
+            title: "Staff Engineer".into(),
+            start: "2021".into(),
+            end: "Present".into(),
+            ..Default::default()
+        }];
+        assert_eq!(recency_score(&current), 1.0);
+        let old = vec![Experience {
+            title: "Engineer".into(),
+            start: "2014".into(),
+            end: "2018".into(),
+            ..Default::default()
+        }];
+        assert!(recency_score(&old) < 0.5);
+    }
+
+    #[test]
+    fn experience_summary_and_index_include_roles() {
+        let mut person = candidate("Sarah Chen", "c1");
+        person.experience = vec![Experience {
+            title: "Staff Engineer".into(),
+            company: "Ledger Co".into(),
+            start: "2021".into(),
+            end: "Present".into(),
+            years: 5.0,
+            description: "Built payment rails".into(),
+        }];
+        person.education = vec![Education {
+            degree: "B.Tech".into(),
+            institution: "University of London".into(),
+            year: "2014".into(),
+        }];
+        person.certifications = vec!["AWS Solutions Architect".into()];
+        assert!(person.index_text().contains("Ledger Co"));
+        assert!(person.index_text().contains("University of London"));
+        assert!(person.index_text().contains("AWS Solutions Architect"));
+        assert_eq!(
+            experience_summary(&person.experience, 3, 120),
+            "Staff Engineer at Ledger Co · 2021 – Present: Built payment rails"
+        );
+        assert_eq!(
+            career_relevance(&person.experience, &["payments".into()]),
+            1.0
+        );
     }
 }

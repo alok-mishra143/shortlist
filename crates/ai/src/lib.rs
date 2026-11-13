@@ -28,6 +28,12 @@ pub struct ExtractedProfile {
     pub email: String,
     #[serde(default)]
     pub phone: String,
+    #[serde(default)]
+    pub experience: Vec<shortlist_core::Experience>,
+    #[serde(default)]
+    pub education: Vec<shortlist_core::Education>,
+    #[serde(default)]
+    pub certifications: Vec<String>,
 }
 
 fn deserialize_optional_f32<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
@@ -197,9 +203,11 @@ impl OpenCode {
     ) -> Result<ExtractedProfile> {
         let truncated: String = text.chars().take(14000).collect();
         let prompt = String::from(
-            r#"You extract structured candidate details from a resume. Return ONLY a JSON object, with no markdown fences and no commentary. Use only facts present in the resume. Use an empty string or empty array when a fact is missing.
-Schema: {"name": string, "headline": string, "location": string, "years": number or null, "skills": [string], "summary": string, "email": string, "phone": string}
+            r#"You extract structured candidate details from a resume. Return ONLY a JSON object, with no markdown fences and no commentary. Use only facts present in the resume. Use an empty string, empty array, or null when a fact is missing.
+Schema: {"name": string, "headline": string, "location": string, "years": number or null, "skills": [string], "summary": string, "email": string, "phone": string, "experience": [{"title": string, "company": string, "start": string, "end": string, "years": number, "description": string}], "education": [{"degree": string, "institution": string, "year": string}], "certifications": [string]}
 Rules: name is the person's full name, never a section heading. headline is their current or most recent job title. location is city and country. years is total professional experience as a number. skills are concrete technologies and tools, at most 20. summary is one or two sentences.
+Experience rules: include every role that is clearly in the resume, most recent first, at most 8. start and end are exactly as written, such as "Mar 2021" and "Present". years is the duration of that role as a number. description is one factual sentence about scope or impact, at most 200 characters. Never invent a company or a title.
+Education rules: at most 3 entries. Certifications: at most 10 short names.
 
 RESUME:
 "#,
@@ -538,5 +546,20 @@ mod tests {
         let profile: ExtractedProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(profile.name, "Alok Mishra");
         assert_eq!(profile.years, Some(4.0));
+    }
+
+    #[test]
+    fn parses_structured_career_fields() {
+        let json = r#"{
+            "name":"Jane Doe",
+            "experience":[{"title":"Senior Engineer","company":"Stripe","start":"Mar 2021","end":"Present","years":"5","description":"Built payments"}],
+            "education":[{"degree":"B.Tech","institution":"University of London","year":"2014"}],
+            "certifications":["AWS Solutions Architect"]
+        }"#;
+        let profile: ExtractedProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.experience[0].company, "Stripe");
+        assert_eq!(profile.experience[0].years, 5.0);
+        assert_eq!(profile.education[0].institution, "University of London");
+        assert_eq!(profile.certifications[0], "AWS Solutions Architect");
     }
 }
