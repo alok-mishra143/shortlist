@@ -6597,7 +6597,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shortlist-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -6609,7 +6609,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -6628,7 +6628,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -6643,7 +6643,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -6654,7 +6654,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-embed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "fastembed",
@@ -6663,7 +6663,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "shortlist-ai",
@@ -6674,7 +6674,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -6686,7 +6686,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-parse"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "pdf-extract",
@@ -6699,7 +6699,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "shortlist-ai",
@@ -6711,7 +6711,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -6724,7 +6724,7 @@ dependencies = [
 
 [[package]]
 name = "shortlist-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "reqwest",
